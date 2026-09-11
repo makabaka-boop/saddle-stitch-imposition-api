@@ -41,15 +41,19 @@
 
 ### `POST /imposition`
 
-请求体仅接受一个字段 `total_pages`：
+请求体**只能**包含一个字段 `total_pages`：
 
 - 必须是**整数**；
 - 取值范围 **4 ≤ total_pages ≤ 128**；
-- 必须能被 **4** 整除。
+- 必须能被 **4** 整除；
+- **不得携带任何其他字段**——拼写错误（如 `total_page`）与无关字段
+  （如 `rotate`、`blank_pages`）一律拒绝，不做静默忽略。
 
 任一条件不满足都返回 **HTTP 422**，错误体为 FastAPI/Pydantic 标准的
-`detail` 数组，其中 `loc` 数组以 `"total_pages"` 结尾，调用方可直接
-定位出错字段；校验失败时**不会输出任何拼版结果（无 sheets 字段）**。
+`detail` 数组，其中每个错误的 `loc` 数组都以对应字段名结尾（页码错误
+为 `["body","total_pages"]`，多余字段为 `["body","<字段名>"]`），调用
+方可直接定位出错字段；校验失败时**不会输出任何拼版结果（无 sheets
+字段）**。多个问题会在同一次响应中全部列出。
 
 #### 请求示例
 
@@ -99,6 +103,21 @@ curl -s -X POST http://localhost:8000/imposition \
 }
 ```
 
+请求：`POST /imposition`，`{"total_pages": 8, "rotate": true}`（夹带多余字段）
+
+```json
+{
+  "detail": [
+    {
+      "type": "extra_forbidden",
+      "loc": ["body", "rotate"],
+      "msg": "Extra inputs are not permitted",
+      "input": true
+    }
+  ]
+}
+```
+
 | 输入 | 结果 |
 | --- | --- |
 | `{"total_pages": 8}` | 200，2 张纸 |
@@ -106,6 +125,9 @@ curl -s -X POST http://localhost:8000/imposition \
 | `{"total_pages": 0}` / `2` / `129` | 422，`…between 4 and 128.` |
 | `{"total_pages": 18}` / `126` | 422，`…divisible by 4.` |
 | `{"total_pages": "16"}` / `16.0` / `true` / `null` | 422，`…must be an integer.` |
+| `{"total_pages": 8, "rotate": true}` | 422，`loc` 指向多余字段 `rotate`（`extra_forbidden`） |
+| `{"total_page": 8}`（字段名拼错） | 422，同时报 `total_pages` 缺失与 `total_page` 多余 |
+| `{"total_pages": 18, "rotate": true}` | 422，同次响应同时列出两处错误 |
 | `{}` | 422，字段缺失 |
 
 > 布尔值虽然是 Python 的 `int` 子类，也会被明确拒绝。

@@ -12,7 +12,10 @@ from .imposition import InvalidTotalPages, MIN_PAGES, MAX_PAGES, validate_total_
 
 
 class ImpositionRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    # Typos (e.g. "total_page") and unrelated fields (e.g. "rotate")
+    # must be rejected with a field-level 422 naming the offending field,
+    # instead of being silently dropped.
+    model_config = ConfigDict(extra="forbid")
 
     total_pages: int = Field(
         description="Booklet page count: integer, 4..128, divisible by 4."

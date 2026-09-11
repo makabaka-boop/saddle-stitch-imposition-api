@@ -120,17 +120,49 @@ def test_malformed_json_returns_422(client) -> None:
     assert "detail" in response.json()
 
 
-def test_extra_fields_are_ignored_not_rejected(client) -> None:
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"rotate": True},
+        {"rotation": 90},
+        {"blank_pages": 2},
+        {"total_page": 8},  # common typo of total_pages
+        {"Total_Pages": 8},  # case mismatch is also a distinct field
+        {"rotate": True, "blank_pages": 2},
+    ],
+)
+def test_extra_fields_are_rejected_with_field_loc(client, extra: dict) -> None:
+    payload: dict = {"total_pages": 8, **extra}
+    response = client.post("/imposition", json=payload)
+
+    assert response.status_code == 422, response.text
+    body = response.json()
+    assert isinstance(body["detail"], list)
+    # No partial imposition is ever returned.
+    assert "sheets" not in body
+    assert "sheet_count" not in body
+
+    reported_fields = {tuple(err["loc"]) for err in body["detail"]}
+    for name in extra:
+        assert ("body", name) in reported_fields
+    for err in body["detail"]:
+        assert err["type"] == "extra_forbidden"
+        assert err["loc"][-1] in extra
+        assert err["msg"]
+
+
+def test_extra_field_and_invalid_total_pages_both_reported(client) -> None:
+    # Every problem must be locatable at once: the stray field AND the
+    # invalid page count, with no partial result.
     response = client.post(
         "/imposition",
-        json={"total_pages": 12, "rotate": True, "blank_pages": 2},
+        json={"total_pages": 18, "rotate": True},
     )
-    assert response.status_code == 200
+    assert response.status_code == 422, response.text
     body = response.json()
-    assert set(body.keys()) == {"total_pages", "sheet_count", "sheets"}
-    # No rotation, no blanks: still exactly 12 pages across 3 sheets.
-    assert body["sheet_count"] == 3
-    pages = [
-        p for sheet in body["sheets"] for p in sheet["front"] + sheet["back"]
-    ]
-    assert sorted(pages) == list(range(1, 13))
+
+    error_by_field = {err["loc"][-1]: err for err in body["detail"]}
+    assert set(error_by_field) == {"total_pages", "rotate"}
+    assert "divisible by 4" in error_by_field["total_pages"]["msg"]
+    assert error_by_field["rotate"]["type"] == "extra_forbidden"
+    assert "sheets" not in body
