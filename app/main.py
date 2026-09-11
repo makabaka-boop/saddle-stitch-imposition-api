@@ -4,8 +4,14 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from .imposition import impose
-from .schemas import ImpositionRequest, ImpositionResponse, SheetOut
+from .imposition import impose, locate_page
+from .schemas import (
+    ImpositionRequest,
+    ImpositionResponse,
+    LocateRequest,
+    LocateResponse,
+    SheetOut,
+)
 
 app = FastAPI(
     title="Saddle-stitched Imposition API",
@@ -42,4 +48,26 @@ def create_imposition(request: ImpositionRequest) -> ImpositionResponse:
             )
             for sheet in result.sheets
         ],
+    )
+
+
+@app.post(
+    "/imposition/locate",
+    response_model=LocateResponse,
+    status_code=200,
+    tags=["imposition"],
+    summary="Locate one page: sheet index, side, slot and same-side partner",
+)
+def locate_imposition_page(request: LocateRequest) -> LocateResponse:
+    # Reuse the same imposition object the full layout endpoint builds; the
+    # core reads the unique position straight off that arrangement.
+    booklet = impose(request.total_pages)
+    location = locate_page(booklet, request.page_number)
+    return LocateResponse(
+        total_pages=booklet.total_pages,
+        page_number=location.page_number,
+        sheet_index=location.sheet_index,
+        side=location.side,
+        position=location.position,
+        partner_page=location.partner_page,
     )

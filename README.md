@@ -132,6 +132,83 @@ curl -s -X POST http://localhost:8000/imposition \
 
 > 布尔值虽然是 Python 的 `int` 子类，也会被明确拒绝。
 
+### `POST /imposition/locate`（单页定位）
+
+抽查单个页码时不必遍历整份拼版结果：提交总页数与要定位的页码，服务复用
+同一套拼版对象，直接返回该页码所在的**纸张序号、正面/背面、左/右位置及同面
+搭档页码**。位置由既有排列结果确定，因此与 `POST /imposition` 永远一致。
+
+请求体**只能**包含两个字段：
+
+- `total_pages`：校验规则与 `POST /imposition` **完全一致**
+  （严格整数、4..128、能被 4 整除、拒绝多余字段）；
+- `page_number`：**严格整数**（拒绝 `"8"`、`8.0`、布尔值、`null` 等），
+  取值范围 **1 ≤ page_number ≤ total_pages**。
+
+任一条件不满足都返回 **HTTP 422**，错误 `loc` 以对应字段名结尾
+（`["body","page_number"]` 或 `["body","total_pages"]`），响应中
+**不附带任何局部定位结果**（无 sheet_index/side/position/partner_page）。
+
+#### 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/imposition/locate \
+  -H 'Content-Type: application/json' \
+  -d '{"total_pages": 16, "page_number": 8}'
+```
+
+#### 合法响应（200）
+
+定位 16 页画册第 1 页（最外层、正面、右位，搭档为第 16 页）：
+
+```json
+{
+  "total_pages": 16,
+  "page_number": 1,
+  "sheet_index": 0,
+  "side": "front",
+  "position": "right",
+  "partner_page": 16
+}
+```
+
+定位第 8 页（最内层纸张 index 3、背面、左位，搭档为第 9 页）：
+
+```json
+{
+  "total_pages": 16,
+  "page_number": 8,
+  "sheet_index": 3,
+  "side": "back",
+  "position": "left",
+  "partner_page": 9
+}
+```
+
+字段说明：
+
+- `total_pages` / `page_number`：回显的合法入参；
+- `sheet_index`：纸张序号，0 基、由外到内（0 为最外层）；
+- `side`：所在面，`front`（正面）或 `back`（背面）；
+- `position`：该面上的左右位置，`left` 或 `right`；
+- `partner_page`：同面搭档页码（该面另一个槽位的页码）。
+
+边界画册：4 页时第 1 页为 `sheet 0 / front / right / partner 4`，第 4 页为
+`sheet 0 / front / left / partner 1`；128 页时第 1 页搭档为 128、第 128 页
+搭档为 1，均位于最外层正面。
+
+| 输入 | 结果 |
+| --- | --- |
+| `{"total_pages": 16, "page_number": 1}` | 200，`0 / front / right / partner 16` |
+| `{"total_pages": 16, "page_number": 8}` | 200，`3 / back / left / partner 9` |
+| `{"total_pages": 4, "page_number": 1}` / `…, 4` | 200，边界画册首末页 |
+| `{"total_pages": 128, "page_number": 1}` / `…, 128` | 200，边界画册首末页 |
+| `{"total_pages": 16, "page_number": 0}` / `17` | 422，`…page_number must be between 1 and 16.` |
+| `{"total_pages": 16, "page_number": "8"}` / `8.0` / `true` / `null` | 422，`…page_number must be an integer.`，loc 指向 `page_number` |
+| `{"total_pages": 16}` | 422，`page_number` 缺失 |
+| `{"total_pages": 18, "page_number": 8}` | 422，仅 `total_pages` 报错（`…divisible by 4.`） |
+| `{"total_pages": 16, "page_number": 8, "rotate": true}` | 422，loc 指向多余字段 `rotate`（`extra_forbidden`） |
+
 ### `GET /health`
 
 返回 `{"status": "ok"}`，供容器健康检查使用。
@@ -175,8 +252,12 @@ pytest 覆盖排列不变量与错误处理：
   出现一次（不重、不漏）；
 - 每张纸严格等于题述公式 `front=[N−2i, 1+2i]`、
   `back=[2+2i, N−1−2i]`，并核对 8 页、16 页手算签名与 4/128 边界；
+- 单页定位对所有合法画册的每个页码与完整拼版逐槽位核对（纸张、面、
+  左右、搭档页码完全一致），并固定 16 页第 1 页（外层正面右位）、
+  第 8 页（内层背面左位）与 4/128 边界页签名；
 - 越界、不被 4 整除、类型错误、缺字段、非法 JSON 均返回 422，
-  且错误 `loc` 可定位到 `total_pages`，响应中不含局部结果。
+  且错误 `loc` 可定位到 `total_pages` / `page_number`，响应中不含局部结果；
+- 原 `POST /imposition` 与 `GET /health` 契约保持不变（回归测试）。
 
 ```bash
 pip install -r requirements.txt
@@ -195,6 +276,7 @@ tests/
   conftest.py
   test_imposition_core.py
   test_api.py
+  test_locate_api.py   # POST /imposition/locate 契约与 422 字段错误
 Dockerfile
 docker-compose.yml
 requirements.txt
