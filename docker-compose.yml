@@ -1,0 +1,22 @@
+# The API service. Host port defaults to 8000 and is overridden by
+# API_PORT, e.g.  API_PORT=9000 docker compose up api
+services:
+  api:
+    build: .
+    image: imposition-api:local
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # One-off verification: runs the pytest suite and exits 0/non-zero.
+  # Usage: docker compose run --rm verify
+  verify:
+    image: imposition-api:local
+    build: .
+    command: ["pytest"]
+    restart: "no"
