@@ -223,6 +223,113 @@ curl -s -X POST http://localhost:8000/imposition/locate \
 返回 `{"status": "ok"}`，供容器健康检查使用。
 交互文档（Swagger UI）位于 `/docs`，OpenAPI 描述位于 `/openapi.json`。
 
+## 纸张成本报价（Quotes）
+
+接单员在拼版前即可为一次印刷形成**可追溯**的纸张成本报价：每张报价单拥有
+**独立编号**（`Q-000001`、`Q-000002`…）、创建时固化且永不改写的**金额快照**，
+以及 **待确认（pending）→ 已确认（confirmed）** 的生命周期。报价数据持久化在
+**同一进程内**的 SQLite 数据库中（迁移随应用启动自动执行，不引入任何新服务）。
+
+纸张总量与金额的计算规则（纯领域对象，可手工复算）：
+
+```
+每册纸张数 sheets_per_booklet = total_pages / 4
+基准纸张   base_sheets        = sheets_per_booklet × print_run
+损耗纸张   loss_sheets        = ⌈base_sheets × loss_rate⌉   （向上取整）
+纸张总量   total_sheets       = base_sheets + loss_sheets
+金额       total_amount       = total_sheets × unit_price   （Decimal，保留两位）
+```
+
+金额一律使用 `Decimal` 并按 **ROUND_HALF_UP 保留两位小数**；单价、损耗率、金额
+在响应中均以字符串形式原样返回（如 `"5250.00"`），不经过二进制浮点。
+
+### `POST /quotes`（创建报价）
+
+请求体**只能**包含四个字段：
+
+- `total_pages`：校验规则与拼版接口**完全一致**（严格整数、4..128、能被 4 整除）；
+- `print_run`：印量，**严格整数**且 **≥ 1**（拒绝布尔值、`"1000"`、`1000.0`）；
+- `unit_price`：每张纸单价，**精确十进制**——只接受**字符串**（如 `"1.25"`）或
+  **整数**（如 `2`）；**JSON 浮点数一律拒绝**（`1.25`、`2.0` 都不行），因为二进制
+  浮点无法精确表示十进制价格；不得为负数；
+- `loss_rate`：损耗率，非负十进制（如 `0.05` 表示 5%），可给数值或字符串；
+  不得为负数。
+
+请求体不得携带任何其他字段。任一条件不满足都返回 **HTTP 422**，错误体为
+FastAPI/Pydantic 标准的 `detail` 数组，`loc` 以出错字段名结尾，且不附带任何
+报价结果；校验失败的请求**不会写入任何数据**（编号不会被消耗）。
+
+成功时返回 **HTTP 201** 与持久化后的完整快照：
+
+```bash
+curl -s -X POST http://localhost:8000/quotes \
+  -H 'Content-Type: application/json' \
+  -d '{"total_pages": 16, "print_run": 1000, "unit_price": "1.25", "loss_rate": 0.05}'
+```
+
+```json
+{
+  "quote_id": "Q-000001",
+  "status": "pending",
+  "total_pages": 16,
+  "print_run": 1000,
+  "unit_price": "1.25",
+  "loss_rate": "0.05",
+  "sheets_per_booklet": 4,
+  "base_sheets": 4000,
+  "loss_sheets": 200,
+  "total_sheets": 4200,
+  "total_amount": "5250.00",
+  "created_at": "2026-09-12T03:09:39.386087+00:00",
+  "confirmed_at": null
+}
+```
+
+即验收基准：**1000 册 16 页画册**，单价 1.25、损耗率 5% → 每册 4 张、基准
+4000 张、损耗 200 张、**总量 4200 张、金额 5250.00**。
+
+| 输入（其余字段同验收例） | 结果 |
+| --- | --- |
+| `unit_price: "1.25"` / `2` | 201，精确十进制 |
+| `unit_price: 1.25` / `2.0`（浮点） | 422，`…not a float.`，loc 指向 `unit_price` |
+| `unit_price: "-0.01"` | 422，`…must not be negative.` |
+| `print_run: 0` / `-1` | 422，`…must be at least 1.` |
+| `print_run: true` / `"1000"` / `1000.0` | 422，`…must be an integer.` |
+| `loss_rate: -0.01` | 422，`…must not be negative.` |
+| 任一字段为布尔值 | 422，loc 指向对应字段 |
+| 夹带 `discount` 等多余字段 | 422，`extra_forbidden`，loc 指向多余字段 |
+| `{}` | 422，四个字段全部报缺失 |
+
+### `POST /quotes/{quote_id}/confirm`（确认采用）
+
+只有**待确认**的报价可以转为已确认；确认只翻转状态并写入 `confirmed_at`，
+**绝不改写原快照**（金额、数量、创建时间保持创建时的值）。
+
+- 成功：**HTTP 200**，返回确认后的完整快照（`status: "confirmed"`）；
+- 编号不存在或无法识别：**HTTP 404**，`{"detail": "Unknown quote_id: '…'."}`；
+- 重复确认：**HTTP 409**，`{"detail": "Quote '…' is already confirmed."}`，
+  原快照（含首次确认时间）保持不变。
+
+```bash
+curl -s -X POST http://localhost:8000/quotes/Q-000001/confirm
+```
+
+### `GET /quotes/{quote_id}`（重新读取）
+
+按编号重新读取已持久化的报价快照，确认前后均可调用；未知编号返回
+**HTTP 404**。进程重启后数据仍在（同一 SQLite 文件）。
+
+```bash
+curl -s http://localhost:8000/quotes/Q-000001
+```
+
+### 报价数据库配置
+
+- 默认数据库文件为工作目录下的 `quotes.sqlite3`；
+- 环境变量 **`QUOTE_DB_PATH`** 可覆盖数据库文件路径；
+- 表结构迁移（`schema_migrations` 版本表）随应用启动在同一进程内执行，
+  重复启动安全（幂等）。
+
 ## 本地运行（不使用 Docker）
 
 ```bash
@@ -266,7 +373,15 @@ pytest 覆盖排列不变量与错误处理：
   第 8 页（内层背面左位）与 4/128 边界页签名；
 - 越界、不被 4 整除、类型错误、缺字段、非法 JSON 均返回 422，
   且错误 `loc` 可定位到 `total_pages` / `page_number`，响应中不含局部结果；
-- 原 `POST /imposition` 与 `GET /health` 契约保持不变（回归测试）。
+- 报价验收基准：1000 册 16 页画册（单价 1.25、损耗率 5%）固定得到
+  4200 张、5250.00；损耗向上取整（4004 张 × 5% → 201 张）、金额两位
+  小数半进位、超大印量不丢精度；
+- 报价生命周期：创建为待确认 → 确认后为已确认且快照不变，确认后可重新
+  读取、进程重启后仍在；未知编号 404、重复确认 409 且不改写原快照；
+- 非法计价参数（布尔值、浮点单价、负数、多余字段、缺字段）均返回 422
+  且 `loc` 指向出错字段，失败请求不消耗报价编号；
+- 原 `POST /imposition`、`POST /imposition/locate` 与 `GET /health`
+  契约保持不变（回归测试）。
 
 ```bash
 pip install -r requirements.txt
@@ -278,14 +393,19 @@ pytest
 ```
 app/
   __init__.py
-  imposition.py   # 纯算法核心（无框架依赖，可独立复用/测试）
-  schemas.py      # Pydantic 请求/响应模型与字段级校验
-  main.py         # FastAPI 路由
+  imposition.py        # 纯拼版算法核心（无框架依赖，可独立复用/测试）
+  quotes.py            # 纯报价领域核心：校验、纸张总量与 Decimal 金额快照
+  quote_repository.py  # SQLite 仓储与版本化迁移（随应用启动、同进程）
+  schemas.py           # Pydantic 请求/响应模型与字段级校验
+  main.py              # FastAPI 路由与启动迁移（lifespan）
 tests/
   conftest.py
   test_imposition_core.py
   test_api.py
-  test_locate_api.py   # POST /imposition/locate 契约与 422 字段错误
+  test_locate_api.py       # POST /imposition/locate 契约与 422 字段错误
+  test_quotes_core.py      # 报价领域核心：算法定量与输入校验
+  test_quotes_repository.py# SQLite 持久化、迁移幂等与生命周期
+  test_quotes_api.py       # 报价 HTTP 契约：验收基准、404/409/422
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -1,25 +1,52 @@
-"""FastAPI application exposing the saddle-stitched imposition endpoint."""
+"""FastAPI application: saddle-stitched imposition and paper-cost quotes."""
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, HTTPException, Request
 
 from .imposition import impose, locate_page
+from .quote_repository import (
+    DEFAULT_DB_PATH,
+    QuoteAlreadyConfirmed,
+    QuoteNotFound,
+    QuoteRepository,
+)
+from .quotes import Quote, build_snapshot, decimal_to_str, parse_quote_id
 from .schemas import (
     ImpositionRequest,
     ImpositionResponse,
     LocateRequest,
     LocateResponse,
+    QuoteRequest,
+    QuoteResponse,
     SheetOut,
 )
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # The SQLite repository lives in this same process: pending
+    # migrations are applied at startup, before the first request.
+    repository = QuoteRepository(os.environ.get("QUOTE_DB_PATH", DEFAULT_DB_PATH))
+    repository.migrate()
+    app.state.quote_repository = repository
+    yield
+
+
 app = FastAPI(
     title="Saddle-stitched Imposition API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Calculate the unique outside-in front/back page order for a "
-        "saddle-stitched booklet."
+        "saddle-stitched booklet, and price the paper for a print run "
+        "as a traceable, confirmable quote."
     ),
+    lifespan=lifespan,
 )
 
 
@@ -71,3 +98,99 @@ def locate_imposition_page(request: LocateRequest) -> LocateResponse:
         position=location.position,
         partner_page=location.partner_page,
     )
+
+
+def _get_quote_repository(request: Request) -> QuoteRepository:
+    # Stored on app.state by the lifespan, so every request in this
+    # process shares the one repository (and the one database file).
+    return request.app.state.quote_repository
+
+
+QuoteRepositoryDep = Annotated[QuoteRepository, Depends(_get_quote_repository)]
+
+
+def _quote_response(quote: Quote) -> QuoteResponse:
+    snapshot = quote.snapshot
+    return QuoteResponse(
+        quote_id=quote.quote_id,
+        status=quote.status,
+        total_pages=snapshot.total_pages,
+        print_run=snapshot.print_run,
+        unit_price=decimal_to_str(snapshot.unit_price),
+        loss_rate=decimal_to_str(snapshot.loss_rate),
+        sheets_per_booklet=snapshot.sheets_per_booklet,
+        base_sheets=snapshot.base_sheets,
+        loss_sheets=snapshot.loss_sheets,
+        total_sheets=snapshot.total_sheets,
+        total_amount=decimal_to_str(snapshot.total_amount),
+        created_at=quote.created_at,
+        confirmed_at=quote.confirmed_at,
+    )
+
+
+@app.post(
+    "/quotes",
+    response_model=QuoteResponse,
+    status_code=201,
+    tags=["quotes"],
+    summary="Price the paper for one print run and persist the quote snapshot",
+)
+def create_quote(
+    request: QuoteRequest, repository: QuoteRepositoryDep
+) -> QuoteResponse:
+    snapshot = build_snapshot(
+        request.total_pages,
+        request.print_run,
+        request.unit_price,
+        request.loss_rate,
+    )
+    quote = repository.insert(snapshot)
+    return _quote_response(quote)
+
+
+@app.post(
+    "/quotes/{quote_id}/confirm",
+    response_model=QuoteResponse,
+    status_code=200,
+    tags=["quotes"],
+    summary="Adopt a pending quote; only pending quotes can be confirmed",
+    responses={
+        404: {"description": "Unknown quote number."},
+        409: {"description": "Quote is already confirmed."},
+    },
+)
+def confirm_quote(quote_id: str, repository: QuoteRepositoryDep) -> QuoteResponse:
+    row_id = parse_quote_id(quote_id)
+    if row_id is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown quote_id: {quote_id!r}."
+        )
+    try:
+        quote = repository.confirm(row_id)
+    except QuoteNotFound:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown quote_id: {quote_id!r}."
+        ) from None
+    except QuoteAlreadyConfirmed:
+        raise HTTPException(
+            status_code=409, detail=f"Quote {quote_id!r} is already confirmed."
+        ) from None
+    return _quote_response(quote)
+
+
+@app.get(
+    "/quotes/{quote_id}",
+    response_model=QuoteResponse,
+    status_code=200,
+    tags=["quotes"],
+    summary="Re-read a persisted quote snapshot by its number",
+    responses={404: {"description": "Unknown quote number."}},
+)
+def get_quote(quote_id: str, repository: QuoteRepositoryDep) -> QuoteResponse:
+    row_id = parse_quote_id(quote_id)
+    quote = repository.get(row_id) if row_id is not None else None
+    if quote is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown quote_id: {quote_id!r}."
+        )
+    return _quote_response(quote)

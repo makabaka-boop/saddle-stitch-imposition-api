@@ -9,7 +9,12 @@ from app.main import app
 
 
 @pytest.fixture()
-def client() -> TestClient:
+def client(tmp_path, monkeypatch) -> TestClient:
+    # Each test gets an isolated SQLite database; entering the TestClient
+    # runs the app lifespan, which applies the migrations against it —
+    # exactly what happens when the real process starts.
+    monkeypatch.setenv("QUOTE_DB_PATH", str(tmp_path / "quotes.sqlite3"))
     # raise_server_exceptions keeps 422 validation responses observable
     # while still surfacing real 500s.
-    return TestClient(app, raise_server_exceptions=True)
+    with TestClient(app, raise_server_exceptions=True) as test_client:
+        yield test_client

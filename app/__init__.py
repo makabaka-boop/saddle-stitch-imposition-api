@@ -1,3 +1,3 @@
-"""Saddle-stitched booklet imposition service."""
+"""Saddle-stitched booklet imposition and paper-cost quote service."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
