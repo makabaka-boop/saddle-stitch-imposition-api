@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from .quotes import (
+    MAX_TOTAL_SHEETS,
     QUOTE_STATUSES,
     STATUS_CONFIRMED,
     STATUS_PENDING,
@@ -61,6 +62,37 @@ class QuoteNotFound(Exception):
 
 class QuoteAlreadyConfirmed(Exception):
     """Raised when an already-confirmed quote is confirmed again."""
+
+
+class QuoteExceedsStorageCapacity(Exception):
+    """Raised when a snapshot's INTEGER columns cannot fit storage.
+
+    Defence in depth: the request boundary rejects such input with a
+    field-level 422 before this layer is reached, but a snapshot built
+    directly against the core is still refused up front instead of dying
+    inside the SQLite driver with an OverflowError mid-insert.
+    """
+
+
+# Every sheet/run column is a signed 64-bit SQLite INTEGER.
+_INTEGER_COLUMNS = (
+    "total_pages",
+    "print_run",
+    "sheets_per_booklet",
+    "base_sheets",
+    "loss_sheets",
+    "total_sheets",
+)
+
+
+def _assert_snapshot_fits_storage(snapshot: QuoteSnapshot) -> None:
+    for column in _INTEGER_COLUMNS:
+        value = getattr(snapshot, column)
+        if value > MAX_TOTAL_SHEETS:
+            raise QuoteExceedsStorageCapacity(
+                f"snapshot column {column}={value} exceeds the SQLite "
+                f"INTEGER capacity of {MAX_TOTAL_SHEETS}."
+            )
 
 
 def _utcnow() -> str:
@@ -109,6 +141,10 @@ class QuoteRepository:
     def insert(self, snapshot: QuoteSnapshot) -> Quote:
         """Persist a new pending quote and return it with its number."""
 
+        # Refuse snapshots the INTEGER columns cannot hold before opening
+        # the write transaction; the request boundary already prevents
+        # these via 422, this keeps direct core callers safe as well.
+        _assert_snapshot_fits_storage(snapshot)
         created_at = _utcnow()
         with self._connection() as connection:
             cursor = connection.execute(

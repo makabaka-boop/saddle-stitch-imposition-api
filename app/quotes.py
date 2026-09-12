@@ -16,8 +16,8 @@ Money is handled with :class:`decimal.Decimal`; the persisted amount is
 quantized to two decimal places (ROUND_HALF_UP) so the stored snapshot
 matches what the order desk recomputes with a calculator. All decimal
 arithmetic runs in a precision sized to the operands so neither the
-default 28-digit context nor huge print runs can silently round a
-snapshot.
+default 28-digit context nor a run at the 64-bit storage width can
+silently round a snapshot.
 """
 
 from __future__ import annotations
@@ -29,6 +29,23 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 from .imposition import PAGES_PER_SHEET, validate_total_pages
 
 MIN_PRINT_RUN = 1
+
+# Every sheet count column is a SQLite INTEGER, i.e. a signed 64-bit
+# value. Inputs whose snapshot could not be stored are rejected at the
+# validation boundary rather than dying mid-persistence with an
+# OverflowError. The print run itself is stored verbatim, and the
+# (larger) sheet totals derived from it must fit in the same width.
+SQLITE_INTEGER_MAX = 2**63 - 1
+MAX_PRINT_RUN = SQLITE_INTEGER_MAX
+MAX_TOTAL_SHEETS = SQLITE_INTEGER_MAX
+
+# The sheet factors hold at most 19 integer digits; the default Decimal
+# context caps the exponent at Emax 999999. A price whose adjusted
+# exponent leaves no room for the multiplication (plus rounding carry)
+# would make total_sheets * unit_price raise decimal.Overflow, so such
+# prices are refused as field errors. 999999 - 19 - 1 (carry) = 999979;
+# rounding to 999970 keeps a safety margin.
+MAX_UNIT_PRICE_EXPONENT = 999_970
 
 STATUS_PENDING = "pending"
 STATUS_CONFIRMED = "confirmed"
@@ -49,7 +66,8 @@ class InvalidUnitPrice(ValueError):
 
 
 class InvalidLossRate(ValueError):
-    """Raised when ``loss_rate`` is not a non-negative decimal rate."""
+    """Raised when ``loss_rate`` is not a non-negative decimal rate, or
+    when it pushes the paper total beyond the storage integer width."""
 
 
 class IncompatibleQuotes(ValueError):
@@ -99,6 +117,10 @@ def validate_print_run(print_run: object) -> int:
     """Return ``print_run`` as an int or raise InvalidPrintRun.
 
     ``bool`` is rejected explicitly even though it subclasses ``int``.
+
+    The upper bound is the storage width: the print run is persisted in a
+    SQLite INTEGER column (signed 64-bit), so a larger value could never
+    be stored and is refused here instead of overflowing on insert.
     """
 
     # bool check must come before isinstance(int) because bool ⊂ int.
@@ -106,6 +128,11 @@ def validate_print_run(print_run: object) -> int:
         raise InvalidPrintRun("print_run must be an integer.")
     if print_run < MIN_PRINT_RUN:
         raise InvalidPrintRun(f"print_run must be at least {MIN_PRINT_RUN}.")
+    if print_run > MAX_PRINT_RUN:
+        raise InvalidPrintRun(
+            f"print_run must be at most {MAX_PRINT_RUN} "
+            "(storage integer capacity)."
+        )
     return print_run
 
 
@@ -146,6 +173,15 @@ def validate_unit_price(unit_price: object) -> Decimal:
         raise InvalidUnitPrice("unit_price must be a finite decimal number.")
     if price < 0:
         raise InvalidUnitPrice("unit_price must not be negative.")
+    if price.adjusted() > MAX_UNIT_PRICE_EXPONENT:
+        # Such a finite value parses (and even survives a multiplication
+        # at a raised precision) but total_sheets * unit_price would
+        # overflow the Decimal exponent range (Emax 999999) while the
+        # amount is computed. Refuse it on the field instead of failing
+        # the money calculation.
+        raise InvalidUnitPrice(
+            "unit_price exponent is too large to compute a quote amount."
+        )
     return price
 
 
@@ -181,13 +217,94 @@ def validate_loss_rate(loss_rate: object) -> Decimal:
     return rate
 
 
+def validate_base_sheets(total_pages: int, print_run: int) -> int:
+    """Validate the pre-waste sheet count against storage width.
+
+    A print run within its own column can still produce more base sheets
+    than a signed 64-bit INTEGER holds (up to 32 sheets/booklet). No loss
+    rate can make that storable, so the offending input is the run.
+
+    Raises:
+        InvalidPrintRun: when ``(total_pages / 4) * print_run`` exceeds the
+            storage integer capacity.
+    """
+
+    per_booklet = total_pages // PAGES_PER_SHEET
+    base_sheets = per_booklet * print_run
+    if base_sheets > MAX_TOTAL_SHEETS:
+        raise InvalidPrintRun(
+            f"print_run must keep base sheets at most {MAX_TOTAL_SHEETS} "
+            "(storage integer capacity); "
+            f"{per_booklet} sheets/booklet times {print_run} booklets "
+            f"is {base_sheets}."
+        )
+    return base_sheets
+
+
+def validate_loss_rate_capacity(loss_rate: Decimal) -> None:
+    """Reject rates too large to keep any positive sheet total storable.
+
+    A rate at/above 10**19 applied to any positive base yields more
+    sheets than the 19-digit INTEGER column could ever hold; checking
+    the exponent also avoids a product beyond Decimal Emax (which would
+    raise decimal.Overflow instead of a field error).
+    """
+
+    max_sheet_exponent = Decimal(MAX_TOTAL_SHEETS).adjusted()
+    if loss_rate > 0 and loss_rate.adjusted() > max_sheet_exponent:
+        raise InvalidLossRate(
+            "loss_rate must keep total sheets at most "
+            f"{MAX_TOTAL_SHEETS} (storage integer capacity)."
+        )
+
+
+def validate_loss_sheets(base_sheets: int, loss_rate: Decimal) -> int:
+    """Validate the waste-inclusive sheet total against storage width.
+
+    A positive rate can push the ceiled total past the signed 64-bit
+    limit even though the base count and the run fit. The check runs
+    before the snapshot is computed or written, and the offending input
+    is the rate. math.ceil on a Decimal is exact regardless of context.
+
+    Raises:
+        InvalidLossRate: when the loss rate drives the total sheet count
+            beyond the storage integer capacity, or is itself so large
+            the waste product would overflow the Decimal exponent range.
+    """
+
+    validate_loss_rate_capacity(loss_rate)
+    loss_sheets = math.ceil(_exact_product(base_sheets, loss_rate))
+    if base_sheets + loss_sheets > MAX_TOTAL_SHEETS:
+        raise InvalidLossRate(
+            "loss_rate must keep total sheets at most "
+            f"{MAX_TOTAL_SHEETS} (storage integer capacity)."
+        )
+    return loss_sheets
+
+
+def validate_snapshot_capacity(
+    total_pages: int, print_run: int, loss_rate: Decimal
+) -> int:
+    """Validate every sheet column of a snapshot; return the loss count.
+
+    Raises:
+        InvalidPrintRun: when the base sheet count already exceeds the
+            storage capacity.
+        InvalidLossRate: when the loss rate drives the total beyond it.
+    """
+
+    base_sheets = validate_base_sheets(total_pages, print_run)
+    return validate_loss_sheets(base_sheets, loss_rate)
+
+
 def _exact_product(factor: int, multiplier: Decimal) -> Decimal:
     """Multiply an int by a Decimal without context-precision rounding.
 
     The default 28-digit context would silently round products with more
-    than 28 significant digits (possible because the print run is
-    unbounded), so the multiplication runs in a context sized to hold
-    every significant digit of both operands.
+    than 28 significant digits (a run at the 19-digit storage width
+    multiplied by a high-precision rate reaches that easily), so the
+    multiplication runs in a context sized to hold every significant
+    digit of both operands.
     """
 
     precision = len(str(factor)) + len(multiplier.as_tuple().digits)
@@ -222,10 +339,12 @@ def build_snapshot(
 
     Raises:
         InvalidTotalPages: if the page count is not a valid booklet size.
-        InvalidPrintRun: if the print run is not a positive integer.
-        InvalidUnitPrice: if the price is a float, bool, negative or not
-            a decimal number.
-        InvalidLossRate: if the loss rate is negative or not a number.
+        InvalidPrintRun: if the print run is not a positive integer that
+            keeps the base sheet count within storage.
+        InvalidUnitPrice: if the price is a float, bool, negative, not a
+            decimal number, or too large to compute the amount.
+        InvalidLossRate: if the rate is negative/non-numeric or pushes
+            the total sheet count beyond storage.
     """
 
     pages = validate_total_pages(total_pages)
@@ -235,9 +354,10 @@ def build_snapshot(
 
     per_booklet = pages // PAGES_PER_SHEET
     base = per_booklet * run
-    # The loss is rounded up to a whole sheet: partial sheets are bought
-    # whole, and math.ceil on a Decimal is exact regardless of context.
-    loss = math.ceil(_exact_product(base, rate))
+    # Refuse sheet totals the INTEGER columns cannot hold *before* any
+    # amount is computed or a row written; this also computes the ceiled
+    # loss count reused below.
+    loss = validate_snapshot_capacity(pages, run, rate)
     total = base + loss
     amount = _quantize_amount(_exact_product(total, price))
     return QuoteSnapshot(
@@ -274,6 +394,29 @@ def parse_quote_id(quote_id: object) -> int | None:
     if not text.isascii() or not text.isdigit():
         return None
     return int(text)
+
+
+def _money_difference(baseline_amount: Decimal, candidate_amount: Decimal) -> Decimal:
+    """Subtract two two-place money decimals without losing low digits.
+
+    Under the default 28-digit context, subtracting operands whose digit
+    counts differ by more than the context precision (e.g. a quote priced
+    at 1E30 against one priced at 0.01) silently discards the smaller
+    operand's low-order digits. The subtraction therefore runs in a
+    context wide enough to hold every significant digit of both operands
+    plus the two money places, and the result is re-quantized to two
+    places so the difference is always complete money.
+    """
+
+    digits_needed = (
+        max(baseline_amount.adjusted(), candidate_amount.adjusted(), 0) + 3
+    )
+    with localcontext() as context:
+        context.prec = max(28, digits_needed)
+        difference = baseline_amount - candidate_amount
+        # Re-quantize inside the wide context; both inputs already carry
+        # two places so this only normalizes the two-place money form.
+        return difference.quantize(AMOUNT_PLACES, rounding=ROUND_HALF_UP)
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,8 +466,11 @@ def compare_quotes(baseline: Quote, candidate: Quote) -> QuoteComparison:
     sheet_difference = (
         baseline.snapshot.total_sheets - candidate.snapshot.total_sheets
     )
-    amount_difference = (
-        baseline.snapshot.total_amount - candidate.snapshot.total_amount
+    # Size the subtraction context to the operands: the default 28-digit
+    # context would drop the low places of the smaller money amount when
+    # the two amounts differ by more than ~28 digits of magnitude.
+    amount_difference = _money_difference(
+        baseline.snapshot.total_amount, candidate.snapshot.total_amount
     )
     # amount_difference is baseline minus candidate: negative means the
     # baseline is cheaper, positive that the candidate is.

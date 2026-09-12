@@ -269,12 +269,109 @@ def test_negative_loss_rate_is_rejected(client, value) -> None:
     assert "negative" in body["detail"][0]["msg"]
 
 
-@pytest.mark.parametrize("value", ["abc", "", None, [0.05]])
+@pytest.mark.parametrize("value", ["abc", "", "1.2.3", None, [0.05]])
 def test_invalid_loss_rate_is_rejected(client, value) -> None:
     response = client.post(
         "/quotes", json={**ACCEPTANCE_PAYLOAD, "loss_rate": value}
     )
     _assert_quote_field_error(response, "loss_rate")
+
+
+# ---------------------------------------------------------------------------
+# Storage-capacity boundaries: nothing may reach the persistence layer
+# in a shape an INTEGER column cannot hold.
+# ---------------------------------------------------------------------------
+
+
+INT64_MAX = 2**63 - 1
+
+
+@pytest.mark.parametrize("value", [2**63, 2**63 + 1, 10**30])
+def test_print_run_beyond_integer_capacity_is_field_rejected(
+    client, value: int
+) -> None:
+    # A run beyond the signed 64-bit SQLite INTEGER width used to pass
+    # validation and die with an OverflowError on insert; it must be a
+    # field-level 422 on print_run instead.
+    response = client.post(
+        "/quotes", json={**ACCEPTANCE_PAYLOAD, "print_run": value}
+    )
+    body = _assert_quote_field_error(response, "print_run")
+    assert "at most" in body["detail"][0]["msg"]
+
+
+def test_print_run_at_integer_capacity_boundary_is_accepted(client) -> None:
+    response = client.post(
+        "/quotes",
+        json={
+            "total_pages": 4,
+            "print_run": INT64_MAX,
+            "unit_price": "0",
+            "loss_rate": 0,
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["base_sheets"] == INT64_MAX
+
+
+def test_run_overflowing_base_sheets_is_rejected_on_print_run(client) -> None:
+    # 128 pages -> 32 sheets/booklet; 10**18 fits the run column but
+    # 32 * 10**18 base sheets do not fit the storage width.
+    response = client.post(
+        "/quotes",
+        json={
+            "total_pages": 128,
+            "print_run": 10**18,
+            "unit_price": "1",
+            "loss_rate": 0,
+        },
+    )
+    body = _assert_quote_field_error(response, "print_run")
+    assert "base sheets" in body["detail"][0]["msg"]
+
+
+def test_loss_rate_pushing_total_sheets_over_capacity_is_rejected_upfront(
+    client,
+) -> None:
+    # The snapshot would compute fine (base 1e18 + 1e19 = 1.1e19 sheets)
+    # but cannot be written; the boundary must refuse the rate before
+    # creation rather than failing after the calculation.
+    response = client.post(
+        "/quotes",
+        json={
+            "total_pages": 4,
+            "print_run": 10**18,
+            "unit_price": "1",
+            "loss_rate": 10,
+        },
+    )
+    body = _assert_quote_field_error(response, "loss_rate")
+    assert "total sheets" in body["detail"][0]["msg"]
+    # No row consumed by the rejected creation.
+    created = client.post("/quotes", json=ACCEPTANCE_PAYLOAD).json()
+    assert created["quote_id"] == "Q-000001"
+
+
+@pytest.mark.parametrize("rate", ["1E19", "1E999999"])
+def test_extremely_large_loss_rate_is_field_rejected(client, rate: str) -> None:
+    response = client.post(
+        "/quotes", json={**ACCEPTANCE_PAYLOAD, "loss_rate": rate}
+    )
+    _assert_quote_field_error(response, "loss_rate")
+
+
+@pytest.mark.parametrize("value", ["1E1000000", "1E999999"])
+def test_astronomically_large_unit_price_is_field_rejected(
+    client, value: str
+) -> None:
+    # A finite decimal that passes every input rule but overflows the
+    # amount multiplication (Decimal Emax 999999) must be a locatable
+    # unit_price error, not a 500 from decimal.Overflow.
+    response = client.post(
+        "/quotes", json={**ACCEPTANCE_PAYLOAD, "unit_price": value}
+    )
+    body = _assert_quote_field_error(response, "unit_price")
+    assert "exponent" in body["detail"][0]["msg"]
 
 
 def test_loss_rate_as_string_is_accepted(client) -> None:
@@ -510,6 +607,49 @@ def test_compare_equal_amounts_reports_null_lower_quote_id(client) -> None:
         "amount_difference": "0.00",
         "lower_quote_id": None,
     }
+
+
+def test_compare_keeps_low_digits_when_amounts_differ_by_many_orders(
+    client,
+) -> None:
+    # Same job, amounts ~28 orders of magnitude apart: the difference
+    # must preserve the smaller amount's two low places instead of
+    # rounding them away under the default 28-digit context.
+    big = client.post(
+        "/quotes",
+        json={**ACCEPTANCE_PAYLOAD, "unit_price": "1E26", "loss_rate": 0},
+    ).json()
+    small = client.post(
+        "/quotes",
+        json={**ACCEPTANCE_PAYLOAD, "unit_price": "0.01", "loss_rate": 0},
+    ).json()
+    assert big["total_amount"] == "400000000000000000000000000000.00"
+    assert small["total_amount"] == "40.00"
+
+    response = client.post(
+        "/quotes/compare",
+        json={
+            "baseline_quote_id": big["quote_id"],
+            "candidate_quote_id": small["quote_id"],
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["amount_difference"] == (
+        "399999999999999999999999999960.00"
+    )
+    assert body["lower_quote_id"] == small["quote_id"]
+
+    swapped = client.post(
+        "/quotes/compare",
+        json={
+            "baseline_quote_id": small["quote_id"],
+            "candidate_quote_id": big["quote_id"],
+        },
+    )
+    assert swapped.json()["amount_difference"] == (
+        "-399999999999999999999999999960.00"
+    )
 
 
 # ---------------------------------------------------------------------------

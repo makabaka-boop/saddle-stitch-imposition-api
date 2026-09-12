@@ -248,12 +248,19 @@ curl -s -X POST http://localhost:8000/imposition/locate \
 请求体**只能**包含四个字段：
 
 - `total_pages`：校验规则与拼版接口**完全一致**（严格整数、4..128、能被 4 整除）；
-- `print_run`：印量，**严格整数**且 **≥ 1**（拒绝布尔值、`"1000"`、`1000.0`）；
+- `print_run`：印量，**严格整数**且 **1 ≤ print_run ≤ 2⁶³−1**（拒绝布尔值、
+  `"1000"`、`1000.0`）；上界是 SQLite `INTEGER`（有符号 64 位）存储宽度，
+  同时要求 `(total_pages / 4) × print_run` 的基准纸张数不超过 2⁶³−1——印量
+  本身可存、但基准纸张列存不下时同样在边界以 `print_run` 字段错误拒绝；
 - `unit_price`：每张纸单价，**精确十进制**——只接受**字符串**（如 `"1.25"`）或
   **整数**（如 `2`）；**JSON 浮点数一律拒绝**（`1.25`、`2.0` 都不行），因为二进制
-  浮点无法精确表示十进制价格；不得为负数；
+  浮点无法精确表示十进制价格；不得为负数；指数过大、乘以纸张总量会越过 Decimal
+  指数容量（`Emax = 999999`）的“有限但天文数字”单价（如 `"1E1000000"`）也会在
+  边界以 `unit_price` 字段错误拒绝，而不是在金额计算阶段溢出；
 - `loss_rate`：损耗率，非负十进制（如 `0.05` 表示 5%），可给数值或字符串；
-  不得为负数。
+  不得为负数；**向上取整后的纸张总量必须不超过 2⁶³−1**——损耗率会把总量推过
+  存储宽度时（含指数大到乘积本身会溢出 Decimal 的情形），在**创建计算之前**即以
+  `loss_rate` 字段错误明确拒绝。
 
 请求体不得携带任何其他字段。任一条件不满足都返回 **HTTP 422**，错误体为
 FastAPI/Pydantic 标准的 `detail` 数组，`loc` 以出错字段名结尾，且不附带任何
@@ -294,6 +301,10 @@ curl -s -X POST http://localhost:8000/quotes \
 | `unit_price: 1.25` / `2.0`（浮点） | 422，`…not a float.`，loc 指向 `unit_price` |
 | `unit_price: "-0.01"` | 422，`…must not be negative.` |
 | `print_run: 0` / `-1` | 422，`…must be at least 1.` |
+| `print_run: 2^63` / `10^30` | 422，`…must be at most 9223372036854775807…`，loc 指向 `print_run` |
+| `print_run` 本身合法但 `(页数/4) × print_run` 超 2⁶³−1 | 422，`…must keep base sheets at most…`，loc 指向 `print_run` |
+| `loss_rate` 使纸张总量超 2⁶³−1（如印量 10¹⁸、损耗率 10） | 422，`…must keep total sheets at most…`，loc 指向 `loss_rate` |
+| `unit_price: "1E1000000"`（有限但指数极大） | 422，`…exponent is too large…`，loc 指向 `unit_price` |
 | `print_run: true` / `"1000"` / `1000.0` | 422，`…must be an integer.` |
 | `loss_rate: -0.01` | 422，`…must not be negative.` |
 | 任一字段为布尔值 | 422，loc 指向对应字段 |
@@ -345,7 +356,10 @@ curl -s http://localhost:8000/quotes/Q-000001
 - `sheet_difference = 基准 total_sheets − 候选 total_sheets`（有符号整数）；
 - `amount_difference = 基准 total_amount − 候选 total_amount`（有符号，
   **两位十进制字符串**，如 `"306.00"`、`"-306.00"`），直接相减两份已量化的
-  金额快照，不经过二进制浮点；
+  金额快照，不经过二进制浮点；减法在按两侧操作数位数扩容的 Decimal 上下文中
+  进行，因此即使两份金额相差超过 28 位数量级，较小金额的低位也不会被默认
+  28 位精度舍弃（如 `4×10²⁹` 与 `40.00` 的差额完整保留为
+  `399999999999999999999999999960.00`）；
 - `lower_quote_id`：金额较低的一方编号；金额相等时为 `null`，该结果与
   基准/候选的先后无关；
 - **交换基准与候选，两个差额符号同时反转**，`lower_quote_id` 不变。

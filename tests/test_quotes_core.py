@@ -8,7 +8,7 @@ and the strict input validation for every quote field.
 from __future__ import annotations
 
 import dataclasses
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 
 import pytest
 
@@ -90,14 +90,30 @@ def test_float_loss_rate_is_converted_exactly() -> None:
     assert snapshot.loss_sheets == 200
 
 
-def test_huge_print_run_does_not_lose_precision() -> None:
-    # Far beyond the default 28-digit decimal context: the loss and the
-    # amount must still be exact. 4 pages -> 1 sheet per booklet.
-    snapshot = build_snapshot(4, 10**30, "1", 0.05)
-    assert snapshot.base_sheets == 10**30
-    assert snapshot.loss_sheets == 5 * 10**28
-    assert snapshot.total_sheets == 105 * 10**28
-    assert snapshot.total_amount == Decimal(105 * 10**28)
+def test_huge_print_run_keeps_exact_arithmetic_within_storage_width() -> None:
+    # A run at the 64-bit storage width produces sheet counts with 19
+    # digits; the loss, total and amount must still be exact (no 28-digit
+    # default-context rounding). 4 pages -> 1 sheet per booklet.
+    run = 10**18
+    snapshot = build_snapshot(4, run, "1.25", "0.05")
+    assert snapshot.base_sheets == 10**18
+    assert snapshot.loss_sheets == 5 * 10**16
+    assert snapshot.total_sheets == 1_050_000_000_000_000_000
+    assert snapshot.total_amount == Decimal("1312500000000000000.00")
+
+
+def test_high_precision_loss_rate_keeps_exact_ceil_with_huge_run() -> None:
+    # 29 significant digits in the product (19-digit base * a 30-digit
+    # rate) exceeds the default 28-digit context; the ceiled loss must
+    # still be exact. 10**18 * rate = 123456789012345678.90123456789...
+    run = 10**18
+    rate = "0.12345678901234567890123456789"
+    snapshot = build_snapshot(4, run, "1", rate)
+    exact_loss = (Decimal(run) * Decimal(rate)).to_integral_value(
+        rounding=ROUND_CEILING
+    )
+    assert snapshot.loss_sheets == int(exact_loss) == 123_456_789_012_345_679
+    assert snapshot.total_sheets == run + snapshot.loss_sheets
 
 
 def test_snapshot_is_immutable() -> None:
@@ -126,6 +142,56 @@ def test_print_run_rejects_non_positive(value: int) -> None:
 def test_print_run_rejects_non_integers(value: object) -> None:
     with pytest.raises(InvalidPrintRun, match="integer"):
         validate_print_run(value)
+
+
+def test_print_run_accepts_storage_width_boundary() -> None:
+    assert validate_print_run(2**63 - 1) == 2**63 - 1
+
+
+@pytest.mark.parametrize("value", [2**63, 2**63 + 1, 10**30])
+def test_print_run_rejects_runs_beyond_storage_integer_width(value: int) -> None:
+    # The print run lives in a signed 64-bit SQLite INTEGER; a larger
+    # value must be refused as a field error, not crash the insert.
+    with pytest.raises(InvalidPrintRun, match="at most"):
+        validate_print_run(value)
+
+
+def test_base_sheets_beyond_storage_width_is_rejected_as_print_run_error() -> None:
+    # 128 pages -> 32 sheets/booklet; a run that fits its own column can
+    # still overflow the base-sheet column.
+    from app.quotes import validate_base_sheets
+
+    with pytest.raises(InvalidPrintRun, match="base sheets"):
+        validate_base_sheets(128, 10**18)
+
+
+def test_loss_rate_pushing_total_beyond_storage_width_is_rejected() -> None:
+    from app.quotes import validate_loss_sheets
+
+    # base 1e18 sheets fits; a rate of 10 yields 1.1e19 sheets, which
+    # does not.
+    with pytest.raises(InvalidLossRate, match="total sheets"):
+        validate_loss_sheets(10**18, Decimal("10"))
+
+
+def test_loss_rate_within_storage_width_is_accepted() -> None:
+    from app.quotes import validate_loss_sheets
+
+    # base 1e18, rate 1 -> another 1e18 loss sheets, total 2e18 fits.
+    assert validate_loss_sheets(10**18, Decimal("1")) == 10**18
+    assert validate_loss_sheets(10**18, Decimal(0)) == 0
+
+
+@pytest.mark.parametrize("rate", ["1E19", "1E999999", "9.9999999999999999999E18"])
+def test_extremely_large_loss_rate_is_rejected_without_decimal_overflow(
+    rate: str,
+) -> None:
+    from app.quotes import validate_loss_sheets
+
+    # A rate whose product would leave the Decimal exponent range (Emax)
+    # must surface as the same field error, not decimal.Overflow.
+    with pytest.raises(InvalidLossRate, match="total sheets"):
+        validate_loss_sheets(4000, Decimal(rate))
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +243,33 @@ def test_unit_price_rejects_non_decimals(value: object) -> None:
 def test_unit_price_rejects_non_finite(value: str) -> None:
     with pytest.raises(InvalidUnitPrice, match="finite"):
         validate_unit_price(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "1E1000000",  # finite, parses fine, product overflows Decimal Emax
+        "1E999999",
+        "9" * 30 + "E999960",  # 30-digit mantissa pushes the product over
+    ],
+)
+def test_unit_price_rejects_too_large_exponent(value: str) -> None:
+    # Such a value is a finite decimal and passes every other rule, but
+    # total_sheets * unit_price would raise decimal.Overflow during the
+    # amount calculation; it must be a locatable field error instead.
+    with pytest.raises(InvalidUnitPrice, match="exponent"):
+        validate_unit_price(value)
+
+
+def test_unit_price_boundary_exponent_is_accepted() -> None:
+    # An ordinary large exponent that still leaves room for the 19-digit
+    # sheet factor and rounding is a valid (if unusual) price.
+    from app.quotes import MAX_UNIT_PRICE_EXPONENT
+
+    price = validate_unit_price(f"1E{MAX_UNIT_PRICE_EXPONENT}")
+    snapshot = build_snapshot(4, 1, price, 0)
+    # One sheet at that price; the amount survives the multiply/quantize.
+    assert snapshot.total_amount > 0
 
 
 # ---------------------------------------------------------------------------
@@ -388,3 +481,32 @@ def test_compare_negative_amount_difference_renders_with_minus_sign() -> None:
 
     assert result.amount_difference == Decimal("-0.99")
     assert decimal_to_str(result.amount_difference) == "-0.99"
+
+
+def test_compare_keeps_low_digits_when_amounts_differ_by_many_orders() -> None:
+    # Two same-calibre quotes whose amounts differ by ~28 orders of
+    # magnitude: under the default 28-digit Decimal context the plain
+    # subtraction discards the smaller amount's low places. The
+    # comparison must still return the complete two-place difference.
+    # 16 pages, 1000 booklets, no loss -> 4000 sheets.
+    baseline = _quote(
+        1, unit_price="1E26", loss_rate=0
+    )  # 4.000E29 -> 400000...000.00
+    candidate = _quote(
+        2, unit_price="0.01", loss_rate=0
+    )  # 40.00
+
+    result = compare_quotes(baseline, candidate)
+
+    expected = Decimal("399999999999999999999999999960.00")
+    assert result.amount_difference == expected
+    assert decimal_to_str(result.amount_difference) == (
+        "399999999999999999999999999960.00"
+    )
+    assert result.amount_difference.as_tuple().exponent == -2
+
+    swapped = compare_quotes(candidate, baseline)
+    assert decimal_to_str(swapped.amount_difference) == (
+        "-399999999999999999999999999960.00"
+    )
+    assert swapped.lower_quote_id == "Q-000002"

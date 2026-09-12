@@ -12,10 +12,17 @@ import pytest
 
 from app.quote_repository import (
     QuoteAlreadyConfirmed,
+    QuoteExceedsStorageCapacity,
     QuoteNotFound,
     QuoteRepository,
 )
-from app.quotes import STATUS_CONFIRMED, STATUS_PENDING, build_snapshot
+from app.quotes import (
+    MAX_TOTAL_SHEETS,
+    STATUS_CONFIRMED,
+    STATUS_PENDING,
+    QuoteSnapshot,
+    build_snapshot,
+)
 
 
 @pytest.fixture()
@@ -74,6 +81,34 @@ def test_decimal_round_trip_keeps_unusual_price(
 
 def test_get_unknown_returns_none(repository: QuoteRepository) -> None:
     assert repository.get(999999) is None
+
+
+def test_insert_refuses_snapshot_beyond_integer_capacity(
+    repository: QuoteRepository,
+) -> None:
+    # Defence in depth: a snapshot built straight from the core objects
+    # (bypassing the request boundary) with an out-of-width column is
+    # refused before the SQLite driver can raise OverflowError, and no
+    # number is consumed.
+    valid = build_snapshot(16, 1000, "1.25", 0.05)
+    oversized = QuoteSnapshot(
+        total_pages=valid.total_pages,
+        print_run=valid.print_run,
+        unit_price=valid.unit_price,
+        loss_rate=valid.loss_rate,
+        sheets_per_booklet=valid.sheets_per_booklet,
+        base_sheets=valid.base_sheets,
+        loss_sheets=valid.loss_sheets,
+        total_sheets=MAX_TOTAL_SHEETS + 1,
+        total_amount=valid.total_amount,
+    )
+
+    with pytest.raises(QuoteExceedsStorageCapacity, match="total_sheets"):
+        repository.insert(oversized)
+
+    # The refused insert consumed no row: the next insert is Q-000001.
+    after = repository.insert(valid)
+    assert after.quote_id == "Q-000001"
 
 
 def test_get_many_returns_quotes_in_input_order(repository: QuoteRepository) -> None:

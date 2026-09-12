@@ -30,11 +30,15 @@ from .imposition import (
 )
 from .quotes import (
     MIN_PRINT_RUN,
+    MAX_PRINT_RUN,
     InvalidLossRate,
     InvalidPrintRun,
     InvalidUnitPrice,
     parse_quote_id,
+    validate_base_sheets,
     validate_loss_rate,
+    validate_loss_rate_capacity,
+    validate_loss_sheets,
     validate_print_run,
     validate_unit_price,
 )
@@ -127,7 +131,11 @@ class QuoteRequest(BaseModel):
     )
     print_run: int = Field(
         ge=MIN_PRINT_RUN,
-        description="Number of booklets to print: strict integer, at least 1.",
+        le=MAX_PRINT_RUN,
+        description=(
+            "Number of booklets to print: strict integer, 1..2^63-1 "
+            "(the SQLite INTEGER storage width)."
+        ),
     )
     unit_price: Decimal = Field(
         ge=0,
@@ -163,11 +171,23 @@ class QuoteRequest(BaseModel):
 
     @field_validator("print_run", mode="before")
     @classmethod
-    def _validate_print_run(cls, value: object) -> int:
+    def _validate_print_run(cls, value: object, info: ValidationInfo) -> int:
         try:
-            return validate_print_run(value)
+            run = validate_print_run(value)
         except InvalidPrintRun as exc:
             raise ValueError(str(exc)) from exc
+        # Cross-field storage guard: up to 32 sheets/booklet means a run
+        # inside its own column can still overflow the base-sheet column.
+        # Validators run in field order, so an accepted total_pages is
+        # already in info.data; when total_pages is itself invalid the
+        # sheet count is unknowable and its error is reported separately.
+        total_pages = info.data.get("total_pages")
+        if total_pages is not None:
+            try:
+                validate_base_sheets(total_pages, run)
+            except InvalidPrintRun as exc:
+                raise ValueError(str(exc)) from exc
+        return run
 
     @field_validator("unit_price", mode="before")
     @classmethod
@@ -179,11 +199,30 @@ class QuoteRequest(BaseModel):
 
     @field_validator("loss_rate", mode="before")
     @classmethod
-    def _validate_loss_rate(cls, value: object) -> Decimal:
+    def _validate_loss_rate(cls, value: object, info: ValidationInfo) -> Decimal:
         try:
-            return validate_loss_rate(value)
+            rate = validate_loss_rate(value)
+            # A rate that cannot leave any positive total storable is a
+            # loss_rate error regardless of the (possibly invalid) other
+            # fields, and must be refused before any product is computed.
+            validate_loss_rate_capacity(rate)
         except InvalidLossRate as exc:
             raise ValueError(str(exc)) from exc
+        # Cross-field storage guard: the ceiled loss must not push the
+        # total past the INTEGER column width. Runs after print_run in
+        # the field order, so both accepted inputs are already in
+        # info.data. The print_run validator already refused an
+        # over-large base, so reaching here the base fits and the only
+        # error this check can produce genuinely belongs to loss_rate.
+        total_pages = info.data.get("total_pages")
+        print_run = info.data.get("print_run")
+        if total_pages is not None and print_run is not None:
+            base_sheets = (total_pages // PAGES_PER_SHEET) * print_run
+            try:
+                validate_loss_sheets(base_sheets, rate)
+            except InvalidLossRate as exc:
+                raise ValueError(str(exc)) from exc
+        return rate
 
 
 class QuoteResponse(BaseModel):
