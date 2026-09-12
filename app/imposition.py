@@ -140,6 +140,22 @@ def validate_page_number(page_number: object, total_pages: int) -> int:
     return page_number
 
 
+def validate_page_number_lower_bound(page_number: object) -> int:
+    """Return ``page_number`` as an int or raise InvalidPageNumber.
+
+    Checks only what holds without a valid ``total_pages``: strict-integer
+    typing and the one-based lower bound. The upper bound is unknowable
+    without a valid booklet size, so it is not checked here.
+    """
+
+    # bool check must come before isinstance(int) because bool ⊂ int.
+    if isinstance(page_number, bool) or not isinstance(page_number, int):
+        raise InvalidPageNumber("page_number must be an integer.")
+    if page_number < 1:
+        raise InvalidPageNumber("page_number must be at least 1.")
+    return page_number
+
+
 def locate_page(booklet: Imposition, page_number: object) -> PageLocation:
     """Locate one page inside an already-built imposition.
 

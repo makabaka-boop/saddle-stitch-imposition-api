@@ -148,6 +148,14 @@ curl -s -X POST http://localhost:8000/imposition \
 任一条件不满足都返回 **HTTP 422**，错误 `loc` 以对应字段名结尾
 （`["body","page_number"]` 或 `["body","total_pages"]`），响应中
 **不附带任何局部定位结果**（无 sheet_index/side/position/partner_page）。
+当 `total_pages` 本身非法时，`page_number` 的一基下界（≥ 1）仍然检查：
+下界越界（如第 0 页）会与 `total_pages` 错误在**同一次响应中同时列出**，
+只有依赖未知上界的检查被跳过。
+
+OpenAPI 描述（`/openapi.json`）中 `LocateRequest` 携带结构化约束，
+生成客户端无需阅读散文即可获知合法包络：`total_pages` 为
+`minimum: 4`、`maximum: 128`、`multipleOf: 4`，`page_number` 为
+`minimum: 1`（上界取决于当次请求的 `total_pages`，故仅见诸字段描述）。
 
 #### 请求示例
 
@@ -207,6 +215,7 @@ curl -s -X POST http://localhost:8000/imposition/locate \
 | `{"total_pages": 16, "page_number": "8"}` / `8.0` / `true` / `null` | 422，`…page_number must be an integer.`，loc 指向 `page_number` |
 | `{"total_pages": 16}` | 422，`page_number` 缺失 |
 | `{"total_pages": 18, "page_number": 8}` | 422，仅 `total_pages` 报错（`…divisible by 4.`） |
+| `{"total_pages": 18, "page_number": 0}` | 422，`total_pages`（`…divisible by 4.`）与 `page_number`（`…at least 1.`）同时报错 |
 | `{"total_pages": 16, "page_number": 8, "rotate": true}` | 422，loc 指向多余字段 `rotate`（`extra_forbidden`） |
 
 ### `GET /health`

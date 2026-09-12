@@ -179,6 +179,25 @@ def test_openapi_documents_locate_contract(client) -> None:
     assert "page_number" in request_props
 
 
+def test_openapi_locate_request_exposes_structured_constraints(client) -> None:
+    # Generated clients must see the whole valid envelope up front, not
+    # just "integer": an 18-page count or page 0 must look invalid in the
+    # contract itself, matching what the endpoint enforces.
+    props = client.get("/openapi.json").json()["components"]["schemas"][
+        "LocateRequest"
+    ]["properties"]
+    total = props["total_pages"]
+    assert total["type"] == "integer"
+    assert total["minimum"] == 4
+    assert total["maximum"] == 128
+    assert total["multipleOf"] == 4
+    # Page numbers are one-based. The upper bound is per-request
+    # (total_pages), so it stays in the description, not the schema.
+    page = props["page_number"]
+    assert page["type"] == "integer"
+    assert page["minimum"] == 1
+
+
 # ---------------------------------------------------------------------------
 # 422 field-level errors: every failure points at the offending field and
 # never includes a partial location.
@@ -257,6 +276,27 @@ def test_invalid_total_pages_and_non_integer_page_number_both_reported(
     assert set(error_by_field) == {"total_pages", "page_number"}
     assert "divisible by 4" in error_by_field["total_pages"]["msg"]
     assert "integer" in error_by_field["page_number"]["msg"]
+
+
+@pytest.mark.parametrize("page_number", [0, -1, -100])
+def test_invalid_total_pages_and_out_of_range_page_number_both_reported(
+    client, page_number: int
+) -> None:
+    # A page below 1 violates the one-based lower bound no matter what the
+    # valid total would be, so it must be reported alongside the
+    # total_pages error instead of disappearing with it.
+    response = client.post(
+        "/imposition/locate",
+        json={"total_pages": 18, "page_number": page_number},
+    )
+    assert response.status_code == 422, response.text
+    error_by_field = {err["loc"][-1]: err for err in response.json()["detail"]}
+    assert set(error_by_field) == {"total_pages", "page_number"}
+    assert "divisible by 4" in error_by_field["total_pages"]["msg"]
+    assert "at least 1" in error_by_field["page_number"]["msg"]
+    # No partial location may ride along with the error envelope.
+    for key in ("sheet_index", "side", "position", "partner_page"):
+        assert key not in response.json()
 
 
 @pytest.mark.parametrize(

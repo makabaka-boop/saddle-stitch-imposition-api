@@ -15,7 +15,9 @@ from .imposition import (
     InvalidTotalPages,
     MAX_PAGES,
     MIN_PAGES,
+    PAGES_PER_SHEET,
     validate_page_number,
+    validate_page_number_lower_bound,
     validate_total_pages,
 )
 
@@ -46,11 +48,19 @@ class LocateRequest(BaseModel):
     # are rejected with a field-level 422 instead of being silently dropped.
     model_config = ConfigDict(extra="forbid")
 
+    # Structured constraints (minimum/maximum/multipleOf in the OpenAPI
+    # schema) let generated clients see the valid envelope up front instead
+    # of only "integer". The before-validators below still run first, so
+    # callers keep receiving the domain error messages from the core.
     total_pages: int = Field(
-        description="Booklet page count: integer, 4..128, divisible by 4."
+        ge=MIN_PAGES,
+        le=MAX_PAGES,
+        multiple_of=PAGES_PER_SHEET,
+        description="Booklet page count: integer, 4..128, divisible by 4.",
     )
     page_number: int = Field(
-        description="Page to locate: strict integer, 1..total_pages."
+        ge=1,
+        description="Page to locate: strict integer, 1..total_pages.",
     )
 
     @field_validator("total_pages", mode="before")
@@ -66,13 +76,15 @@ class LocateRequest(BaseModel):
     def _validate_page_number(cls, value: object, info: ValidationInfo) -> int:
         # Validators run in field declaration order, so an accepted
         # total_pages is already in info.data. When total_pages itself is
-        # invalid, only its field error is reported; the range check against
-        # an unknown bound is skipped while strict-integer typing still
-        # applies so both bad fields stay locatable when independent.
+        # invalid the upper bound is unknowable, but strict-integer typing
+        # and the one-based lower bound still apply, so an out-of-range page
+        # (e.g. 0) is reported alongside the total_pages error instead of
+        # being silently dropped.
         if "total_pages" not in info.data:
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise InvalidPageNumber("page_number must be an integer.")
-            return value
+            try:
+                return validate_page_number_lower_bound(value)
+            except InvalidPageNumber as exc:
+                raise ValueError(str(exc)) from exc
         try:
             return validate_page_number(value, info.data["total_pages"])
         except InvalidPageNumber as exc:

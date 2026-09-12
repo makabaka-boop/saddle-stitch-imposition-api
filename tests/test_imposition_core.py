@@ -18,6 +18,7 @@ from app.imposition import (
     impose,
     locate_page,
     validate_page_number,
+    validate_page_number_lower_bound,
     validate_total_pages,
 )
 
@@ -305,3 +306,28 @@ def test_locate_range_bound_tracks_total_pages() -> None:
     assert locate_page(impose(16), 16).partner_page == 1
     with pytest.raises(InvalidPageNumber, match="between 1 and 4"):
         locate_page(impose(4), 16)
+
+
+# ---------------------------------------------------------------------------
+# validate_page_number_lower_bound: the checks that hold without a valid
+# total_pages (used when the booklet size itself failed validation).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [1, 2, 100, 128, 1000])
+def test_lower_bound_accepts_one_based_ints(value: int) -> None:
+    # Any int >= 1 passes: the upper bound is unknowable without a valid
+    # total_pages, so even 1000 is not rejected here.
+    assert validate_page_number_lower_bound(value) == value
+
+
+@pytest.mark.parametrize("value", [0, -1, -100])
+def test_lower_bound_rejects_below_one(value: int) -> None:
+    with pytest.raises(InvalidPageNumber, match="at least 1"):
+        validate_page_number_lower_bound(value)
+
+
+@pytest.mark.parametrize("value", ["8", 8.0, 8.5, None, True, False, [8], {}, object()])
+def test_lower_bound_rejects_non_integer_types(value: object) -> None:
+    with pytest.raises(InvalidPageNumber, match="integer"):
+        validate_page_number_lower_bound(value)
