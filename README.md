@@ -323,6 +323,78 @@ curl -s -X POST http://localhost:8000/quotes/Q-000001/confirm
 curl -s http://localhost:8000/quotes/Q-000001
 ```
 
+### `POST /quotes/compare`（两套方案差额核对）
+
+接单员确认报价前常要比较同一画册的两套纸价或损耗方案。提交**基准报价
+编号**与**候选报价编号**，服务一次批量读取两份持久化快照（按输入顺序，
+不依赖存储返回顺序），返回双方编号、**纸张总量差**、**金额差**与**较低金额
+的报价编号**。
+
+请求体**只能**包含两个字段（多余字段 422）：
+
+- `baseline_quote_id` / `candidate_quote_id`：报价编号字符串
+  （`Q-000001` 形式，也接受裸数字 `1`）；两者必须是**不同编号**
+  （`"Q-000001"` 与 `"1"` 也视为同一编号，返回 422）；
+- 编号必须是**字符串**：布尔值、整数、`null` 等非字符串一律 **422**，
+  `loc` 指向出错字段。
+
+比较规则（纯领域层，路由只做编号解析、对象组装与错误映射）：
+
+- 仅允许**总页数与印量均一致**的组合——即同一画册同一印量的两套计价方案；
+  口径不一致返回 **HTTP 409**，错误体列出双方编号及各自页数/印量；
+- `sheet_difference = 基准 total_sheets − 候选 total_sheets`（有符号整数）；
+- `amount_difference = 基准 total_amount − 候选 total_amount`（有符号，
+  **两位十进制字符串**，如 `"306.00"`、`"-306.00"`），直接相减两份已量化的
+  金额快照，不经过二进制浮点；
+- `lower_quote_id`：金额较低的一方编号；金额相等时为 `null`，该结果与
+  基准/候选的先后无关；
+- **交换基准与候选，两个差额符号同时反转**，`lower_quote_id` 不变。
+
+任何失败（404/409/422）都是只读核对：**不改写**任一报价的状态、确认时间或
+金额快照。
+
+```bash
+curl -s -X POST http://localhost:8000/quotes/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"baseline_quote_id": "Q-000001", "candidate_quote_id": "Q-000002"}'
+```
+
+以两份 **16 页 / 1000 册** 报价为例（Q-000001：单价 1.25、损耗 5% →
+4200 张、5250.00；Q-000002：单价 1.20、损耗 3% → 4120 张、4944.00）：
+
+```json
+{
+  "baseline_quote_id": "Q-000001",
+  "candidate_quote_id": "Q-000002",
+  "sheet_difference": 80,
+  "amount_difference": "306.00",
+  "lower_quote_id": "Q-000002"
+}
+```
+
+交换基准与候选后：
+
+```json
+{
+  "baseline_quote_id": "Q-000002",
+  "candidate_quote_id": "Q-000001",
+  "sheet_difference": -80,
+  "amount_difference": "-306.00",
+  "lower_quote_id": "Q-000002"
+}
+```
+
+| 情形 | 结果 |
+| --- | --- |
+| 同口径两份报价 | 200，有符号纸张差/金额差（两位小数字符串）与较低金额编号 |
+| 金额相等 | 200，`amount_difference: "0.00"`，`lower_quote_id: null` |
+| 交换基准/候选 | 200，两个差额符号反转，`lower_quote_id` 不变 |
+| 任一编号格式非法或不存在 | **404**，`{"detail": "Unknown quote_id: '…'."}`，指出对应编号 |
+| 总页数或印量不一致 | **409**，错误体列出双方编号与各自页数、印量 |
+| 两个编号相同（含 `Q-1` 与 `1`） | **422**，`…must be different.` |
+| 编号为布尔值/整数/`null` | **422**，`loc` 指向 `baseline_quote_id` / `candidate_quote_id` |
+| 夹带多余字段 / 缺字段 | **422**（`extra_forbidden` / 字段缺失） |
+
 ### 报价数据库配置
 
 - 默认数据库文件为工作目录下的 `quotes.sqlite3`；
@@ -378,6 +450,11 @@ pytest 覆盖排列不变量与错误处理：
   小数半进位、超大印量不丢精度；
 - 报价生命周期：创建为待确认 → 确认后为已确认且快照不变，确认后可重新
   读取、进程重启后仍在；未知编号 404、重复确认 409 且不改写原快照；
+- 方案核对：两份同为 16 页 1000 册的报价核对正/负纸张差与精确金额差，
+  交换基准与候选后两个差额符号反转、较低金额编号不变；金额相等时
+  `lower_quote_id` 为 `null`；缺失/非法编号 404 并指出对应编号、页数或
+  印量口径冲突 409，任何失败都不改写报价状态、确认时间或金额快照；
+  相同编号（含 `Q-1` 与 `1`）、布尔值、非字符串编号、多余与缺失字段均 422；
 - 非法计价参数（布尔值、浮点单价、负数、多余字段、缺字段）均返回 422
   且 `loc` 指向出错字段，失败请求不消耗报价编号；
 - 原 `POST /imposition`、`POST /imposition/locate` 与 `GET /health`
@@ -403,9 +480,9 @@ tests/
   test_imposition_core.py
   test_api.py
   test_locate_api.py       # POST /imposition/locate 契约与 422 字段错误
-  test_quotes_core.py      # 报价领域核心：算法定量与输入校验
-  test_quotes_repository.py# SQLite 持久化、迁移幂等与生命周期
-  test_quotes_api.py       # 报价 HTTP 契约：验收基准、404/409/422
+  test_quotes_core.py      # 报价领域核心：算法定量、方案核对与输入校验
+  test_quotes_repository.py# SQLite 持久化、批量取回、迁移幂等与生命周期
+  test_quotes_api.py       # 报价 HTTP 契约：验收基准、compare、404/409/422
 Dockerfile
 docker-compose.yml
 requirements.txt

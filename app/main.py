@@ -16,12 +16,21 @@ from .quote_repository import (
     QuoteNotFound,
     QuoteRepository,
 )
-from .quotes import Quote, build_snapshot, decimal_to_str, parse_quote_id
+from .quotes import (
+    IncompatibleQuotes,
+    Quote,
+    build_snapshot,
+    compare_quotes,
+    decimal_to_str,
+    parse_quote_id,
+)
 from .schemas import (
     ImpositionRequest,
     ImpositionResponse,
     LocateRequest,
     LocateResponse,
+    QuoteCompareRequest,
+    QuoteCompareResponse,
     QuoteRequest,
     QuoteResponse,
     SheetOut,
@@ -40,7 +49,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="Saddle-stitched Imposition API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Calculate the unique outside-in front/back page order for a "
         "saddle-stitched booklet, and price the paper for a print run "
@@ -194,3 +203,58 @@ def get_quote(quote_id: str, repository: QuoteRepositoryDep) -> QuoteResponse:
             status_code=404, detail=f"Unknown quote_id: {quote_id!r}."
         )
     return _quote_response(quote)
+
+
+@app.post(
+    "/quotes/compare",
+    response_model=QuoteCompareResponse,
+    status_code=200,
+    tags=["quotes"],
+    summary="Diff two persisted quotes for the same print job",
+    responses={
+        404: {"description": "A submitted quote number is unknown."},
+        409: {"description": "The quotes price different jobs."},
+    },
+)
+def compare_quote_snapshots(
+    request: QuoteCompareRequest, repository: QuoteRepositoryDep
+) -> QuoteCompareResponse:
+    # The handler only parses numbers, assembles domain objects from the
+    # repository batch read, and maps domain failures onto HTTP codes:
+    # no pricing or compatibility rules live here.
+    baseline_id = parse_quote_id(request.baseline_quote_id)
+    if baseline_id is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown quote_id: {request.baseline_quote_id!r}.",
+        )
+    candidate_id = parse_quote_id(request.candidate_quote_id)
+    if candidate_id is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown quote_id: {request.candidate_quote_id!r}.",
+        )
+    # One batch read keeps the input order: result[0] is the baseline
+    # even when its number is larger than the candidate's.
+    baseline, candidate = repository.get_many((baseline_id, candidate_id))
+    if baseline is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown quote_id: {request.baseline_quote_id!r}.",
+        )
+    if candidate is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown quote_id: {request.candidate_quote_id!r}.",
+        )
+    try:
+        comparison = compare_quotes(baseline, candidate)
+    except IncompatibleQuotes as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    return QuoteCompareResponse(
+        baseline_quote_id=comparison.baseline_quote_id,
+        candidate_quote_id=comparison.candidate_quote_id,
+        sheet_difference=comparison.sheet_difference,
+        amount_difference=decimal_to_str(comparison.amount_difference),
+        lower_quote_id=comparison.lower_quote_id,
+    )

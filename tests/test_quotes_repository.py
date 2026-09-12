@@ -76,6 +76,42 @@ def test_get_unknown_returns_none(repository: QuoteRepository) -> None:
     assert repository.get(999999) is None
 
 
+def test_get_many_returns_quotes_in_input_order(repository: QuoteRepository) -> None:
+    first = repository.insert(build_snapshot(16, 1000, "1.25", 0.05))
+    second = repository.insert(build_snapshot(8, 10, 2, 0))
+    third = repository.insert(build_snapshot(4, 3, "0.25", 0))
+
+    # Reversed and non-contiguous ids: the result order follows the
+    # request, not the IN-clause storage order, and missing ids slot in
+    # as None without shifting the found rows.
+    result = repository.get_many((3, 999999, 1, 2))
+
+    assert [quote.quote_id if quote is not None else None for quote in result] == [
+        "Q-000003",
+        None,
+        "Q-000001",
+        "Q-000002",
+    ]
+    assert result[0] is not None and result[0].snapshot == third.snapshot
+    assert result[2] == first
+    assert result[3] == second
+
+
+def test_get_many_deduplicates_repeated_ids(repository: QuoteRepository) -> None:
+    created = repository.insert(build_snapshot(16, 1000, "1.25", 0.05))
+
+    result = repository.get_many((1, 1))
+
+    assert len(result) == 2
+    assert result[0] == result[1] == created
+
+
+def test_get_many_empty_tuple_returns_empty_list(
+    repository: QuoteRepository,
+) -> None:
+    assert repository.get_many(()) == []
+
+
 def test_confirm_flips_status_and_stamps_timestamp(
     repository: QuoteRepository,
 ) -> None:

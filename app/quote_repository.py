@@ -153,6 +153,27 @@ class QuoteRepository:
             ).fetchone()
         return _row_to_quote(row) if row is not None else None
 
+    def get_many(self, row_ids: tuple[int, ...]) -> list[Quote | None]:
+        """Fetch several quotes in one read, keeping the input order.
+
+        Returns one slot per requested id: the stored quote, or ``None``
+        for an id without a row. The SQL ``IN`` clause itself does not
+        guarantee result order, so rows are mapped back onto the request
+        explicitly — the comparison relies on ``result[0]`` being the
+        baseline even when its number is larger than the candidate's.
+        """
+
+        if not row_ids:
+            return []
+        placeholders = ", ".join("?" for _ in row_ids)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM quotes WHERE id IN ({placeholders})",
+                tuple(row_ids),
+            ).fetchall()
+        by_id = {row["id"]: _row_to_quote(row) for row in rows}
+        return [by_id.get(row_id) for row_id in row_ids]
+
     def confirm(self, row_id: int) -> Quote:
         """Move a pending quote to confirmed and return the stored row.
 

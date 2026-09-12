@@ -9,7 +9,14 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from .imposition import (
     InvalidPageNumber,
@@ -26,6 +33,7 @@ from .quotes import (
     InvalidLossRate,
     InvalidPrintRun,
     InvalidUnitPrice,
+    parse_quote_id,
     validate_loss_rate,
     validate_print_run,
     validate_unit_price,
@@ -212,6 +220,59 @@ class SheetOut(BaseModel):
     back: list[int] = Field(description="Back side pages, left to right.")
 
 
+class QuoteCompareRequest(BaseModel):
+    # Same strict boundary as the other requests: a typo or an unrelated
+    # field is a field-level 422 instead of being silently dropped.
+    model_config = ConfigDict(extra="forbid")
+
+    baseline_quote_id: str = Field(
+        description="Number of the quote treated as the baseline, e.g. Q-000001."
+    )
+    candidate_quote_id: str = Field(
+        description="Number of the alternative quote, e.g. Q-000002."
+    )
+
+    @field_validator("baseline_quote_id", "candidate_quote_id", mode="before")
+    @classmethod
+    def _reject_non_strings(cls, value: object) -> str:
+        # Quote numbers are strings: bool (an int subclass), ints, null,
+        # lists, ... are boundary type errors rather than unknown rows.
+        if not isinstance(value, str):
+            raise ValueError("quote_id must be a string.")
+        return value
+
+    @model_validator(mode="after")
+    def _reject_same_quote(self) -> QuoteCompareRequest:
+        # Comparing a quote against itself produces zero-everything noise;
+        # the boundary refuses it before any storage lookup. The check is
+        # on the parsed numbers so "Q-000001" and "1" are also the same.
+        baseline_id = parse_quote_id(self.baseline_quote_id)
+        candidate_id = parse_quote_id(self.candidate_quote_id)
+        if (
+            baseline_id is not None
+            and candidate_id is not None
+            and baseline_id == candidate_id
+        ):
+            raise ValueError(
+                "baseline_quote_id and candidate_quote_id must be different."
+            )
+        return self
+
+
+class QuoteCompareResponse(BaseModel):
+    baseline_quote_id: str = Field(description="Echoed baseline quote number.")
+    candidate_quote_id: str = Field(description="Echoed candidate quote number.")
+    sheet_difference: int = Field(
+        description="Baseline minus candidate total paper sheets (signed)."
+    )
+    amount_difference: str = Field(
+        description="Baseline minus candidate total amount, 2 places (signed)."
+    )
+    lower_quote_id: str | None = Field(
+        description="The cheaper quote's number; null when amounts tie."
+    )
+
+
 class ImpositionResponse(BaseModel):
     total_pages: int
     sheet_count: int
@@ -238,6 +299,8 @@ __all__ = [
     "ImpositionResponse",
     "LocateRequest",
     "LocateResponse",
+    "QuoteCompareRequest",
+    "QuoteCompareResponse",
     "QuoteRequest",
     "QuoteResponse",
     "SheetOut",

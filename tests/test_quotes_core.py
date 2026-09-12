@@ -14,10 +14,14 @@ import pytest
 
 from app.imposition import InvalidTotalPages
 from app.quotes import (
+    IncompatibleQuotes,
     InvalidLossRate,
     InvalidPrintRun,
     InvalidUnitPrice,
+    STATUS_PENDING,
+    Quote,
     build_snapshot,
+    compare_quotes,
     decimal_to_str,
     format_quote_id,
     parse_quote_id,
@@ -262,3 +266,125 @@ def test_decimal_to_str_avoids_scientific_notation() -> None:
     assert decimal_to_str(Decimal("5250.00")) == "5250.00"
     assert decimal_to_str(Decimal("0.05")) == "0.05"
     assert decimal_to_str(Decimal("1E-7")) == "0.0000001"
+
+
+# ---------------------------------------------------------------------------
+# compare_quotes: signed paper/amount differences for one print job.
+# ---------------------------------------------------------------------------
+
+
+def _quote(number: int, **kwargs) -> Quote:
+    """Build a pending Quote with the given number from snapshot kwargs."""
+
+    snapshot = build_snapshot(
+        kwargs.get("total_pages", 16),
+        kwargs.get("print_run", 1000),
+        kwargs.get("unit_price", "1.25"),
+        kwargs.get("loss_rate", 0.05),
+    )
+    return Quote(
+        quote_id=format_quote_id(number),
+        snapshot=snapshot,
+        status=STATUS_PENDING,
+        created_at="2026-09-12T00:00:00+00:00",
+        confirmed_at=None,
+    )
+
+
+def test_compare_acceptance_pair_baseline_minus_candidate() -> None:
+    # Both are 16-page, 1000-booklet jobs but with different paper
+    # prices/loss plans:
+    #   baseline (Q-000001): 1.25/sheet, 5% loss -> 4200 sheets, 5250.00
+    #   candidate (Q-000002): 1.20/sheet, 3% loss -> 4120 sheets, 4944.00
+    baseline = _quote(1)
+    candidate = _quote(
+        2, unit_price="1.20", loss_rate=0.03
+    )
+
+    result = compare_quotes(baseline, candidate)
+
+    assert result.baseline_quote_id == "Q-000001"
+    assert result.candidate_quote_id == "Q-000002"
+    assert result.sheet_difference == 4200 - 4120 == 80
+    assert result.amount_difference == Decimal("5250.00") - Decimal("4944.00")
+    assert result.amount_difference == Decimal("306.00")
+    assert result.lower_quote_id == "Q-000002"
+
+
+def test_compare_swap_reverses_both_signs_but_not_lower_id() -> None:
+    baseline = _quote(1)
+    candidate = _quote(2, unit_price="1.20", loss_rate=0.03)
+
+    swapped = compare_quotes(candidate, baseline)
+
+    assert swapped.baseline_quote_id == "Q-000002"
+    assert swapped.candidate_quote_id == "Q-000001"
+    assert swapped.sheet_difference == -80
+    assert swapped.amount_difference == Decimal("-306.00")
+    # The cheaper side is a property of the two quotes, not of order.
+    assert swapped.lower_quote_id == "Q-000002"
+
+
+def test_compare_identical_amounts_ties_with_null_lower_id() -> None:
+    first = _quote(1)
+    second = _quote(2)
+
+    result = compare_quotes(first, second)
+
+    assert result.sheet_difference == 0
+    assert result.amount_difference == Decimal("0.00")
+    assert result.lower_quote_id is None
+
+
+def test_compare_cheaper_baseline_names_baseline_as_lower() -> None:
+    baseline = _quote(1, unit_price="1.00", loss_rate=0)  # 4000.00
+    candidate = _quote(2)  # 5250.00
+
+    result = compare_quotes(baseline, candidate)
+
+    assert result.amount_difference == Decimal("-1250.00")
+    assert result.sheet_difference == 4000 - 4200
+    assert result.lower_quote_id == "Q-000001"
+
+
+def test_compare_rejects_different_total_pages() -> None:
+    baseline = _quote(1, total_pages=16)
+    candidate = _quote(2, total_pages=8)
+
+    with pytest.raises(IncompatibleQuotes, match="16 pages"):
+        compare_quotes(baseline, candidate)
+
+
+def test_compare_rejects_different_print_runs() -> None:
+    baseline = _quote(1, print_run=1000)
+    candidate = _quote(2, print_run=500)
+
+    with pytest.raises(IncompatibleQuotes, match="1000 booklets"):
+        compare_quotes(baseline, candidate)
+
+
+def test_compare_keeps_exact_two_place_money_difference() -> None:
+    # 4 pages, 3 booklets, no loss: 3 sheets.
+    # baseline at 0.255 -> 0.77 (half-up snapshot); candidate at 0.25 -> 0.75.
+    baseline = _quote(
+        1, total_pages=4, print_run=3, unit_price="0.255", loss_rate=0
+    )
+    candidate = _quote(
+        2, total_pages=4, print_run=3, unit_price="0.25", loss_rate=0
+    )
+
+    result = compare_quotes(baseline, candidate)
+
+    assert result.sheet_difference == 0
+    assert result.amount_difference == Decimal("0.02")
+    assert decimal_to_str(result.amount_difference) == "0.02"
+
+
+def test_compare_negative_amount_difference_renders_with_minus_sign() -> None:
+    baseline = _quote(1, total_pages=4, print_run=1, unit_price="0.01", loss_rate=0)
+    candidate = _quote(2, total_pages=4, print_run=1, unit_price="1.00", loss_rate=0)
+
+    result = compare_quotes(baseline, candidate)
+
+    assert result.amount_difference == Decimal("-0.99")
+    assert decimal_to_str(result.amount_difference) == "-0.99"

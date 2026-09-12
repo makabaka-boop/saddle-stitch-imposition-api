@@ -52,6 +52,15 @@ class InvalidLossRate(ValueError):
     """Raised when ``loss_rate`` is not a non-negative decimal rate."""
 
 
+class IncompatibleQuotes(ValueError):
+    """Raised when two quotes do not describe the same print job.
+
+    Only quotes with the same booklet page count and the same print run
+    can be compared: the sheet/amount difference would otherwise mix two
+    different jobs instead of two pricing alternatives for one job.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class QuoteSnapshot:
     """Immutable pricing facts persisted with a quote.
@@ -265,6 +274,73 @@ def parse_quote_id(quote_id: object) -> int | None:
     if not text.isascii() or not text.isdigit():
         return None
     return int(text)
+
+
+@dataclass(frozen=True, slots=True)
+class QuoteComparison:
+    """The signed difference between two persisted quote snapshots.
+
+    ``sheet_difference`` and ``amount_difference`` are
+    baseline-minus-candidate, so swapping the two inputs reverses both
+    signs. ``lower_quote_id`` names the cheaper quote, or is ``None``
+    when the amounts tie.
+    """
+
+    baseline_quote_id: str
+    candidate_quote_id: str
+    sheet_difference: int
+    amount_difference: Decimal
+    lower_quote_id: str | None
+
+
+def compare_quotes(baseline: Quote, candidate: Quote) -> QuoteComparison:
+    """Diff two quotes' paper totals and amounts.
+
+    Both snapshots must price the same job — identical booklet page
+    count and identical print run — even though their paper price or
+    loss alternatives may differ. The persisted two-place amount
+    snapshots are subtracted directly, so the difference itself stays an
+    exact money decimal with two fraction places.
+
+    Raises:
+        IncompatibleQuotes: if the page counts or print runs differ.
+    """
+
+    if (
+        baseline.snapshot.total_pages != candidate.snapshot.total_pages
+        or baseline.snapshot.print_run != candidate.snapshot.print_run
+    ):
+        raise IncompatibleQuotes(
+            "Quotes "
+            f"{baseline.quote_id!r} ({baseline.snapshot.total_pages} pages, "
+            f"{baseline.snapshot.print_run} booklets) and "
+            f"{candidate.quote_id!r} ({candidate.snapshot.total_pages} pages, "
+            f"{candidate.snapshot.print_run} booklets) price different jobs; "
+            "only quotes with the same total_pages and print_run are "
+            "comparable."
+        )
+
+    sheet_difference = (
+        baseline.snapshot.total_sheets - candidate.snapshot.total_sheets
+    )
+    amount_difference = (
+        baseline.snapshot.total_amount - candidate.snapshot.total_amount
+    )
+    # amount_difference is baseline minus candidate: negative means the
+    # baseline is cheaper, positive that the candidate is.
+    if amount_difference < 0:
+        lower_quote_id = baseline.quote_id
+    elif amount_difference > 0:
+        lower_quote_id = candidate.quote_id
+    else:
+        lower_quote_id = None
+    return QuoteComparison(
+        baseline_quote_id=baseline.quote_id,
+        candidate_quote_id=candidate.quote_id,
+        sheet_difference=sheet_difference,
+        amount_difference=amount_difference,
+        lower_quote_id=lower_quote_id,
+    )
 
 
 def decimal_to_str(value: Decimal) -> str:
