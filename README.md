@@ -409,6 +409,97 @@ curl -s -X POST http://localhost:8000/quotes/compare \
 | 编号为布尔值/整数/`null` | **422**，`loc` 指向 `baseline_quote_id` / `candidate_quote_id` |
 | 夹带多余字段 / 缺字段 | **422**（`extra_forbidden` / 字段缺失） |
 
+### 成品装箱（Packing plans）
+
+装订完成后，后道人员按**报价快照的印量**生成成品装箱单，避免手工划分册号时
+出现**重装、漏装或末箱数量错误**。提交**来源报价编号**与**每箱容量**后，
+服务读取该报价创建时固化的 `print_run` 快照，从**第 1 册起连续分箱**：
+
+```
+总箱数 carton_count = ⌈print_run / carton_capacity⌉
+第 i 箱（0 基）册号范围：
+  start_copy = i × carton_capacity + 1
+  end_copy   = min((i + 1) × carton_capacity, print_run)
+```
+
+每册（1..print_run 的一基册号）**恰好落入一箱**，各箱范围连续、无重叠、无缺口；
+除最后一箱可能不足外，每箱都恰好装满 `carton_capacity` 册。分配是纯领域函数，
+同一印量与容量永远得到相同分箱（确定性）。装箱单编号为 `PK-000001`、
+`PK-000002`……，与报价编号相互独立、各自连续；装箱单一经生成即**不可变快照**，
+保存装箱单编号、来源报价、印量、每箱容量、总箱数及各箱册号范围。
+
+### `POST /packing-plans`（生成装箱单）
+
+请求体**只能**包含两个字段：
+
+- `quote_id`：来源报价编号，**字符串**（如 `"Q-000001"`，也接受裸数字 `"1"`）；
+  布尔值、整数、`null` 等非字符串返回定位到 `quote_id` 的 **422**；
+  编号格式无法识别或报价不存在返回 **404**（待确认与已确认报价均可装箱）；
+- `carton_capacity`：每箱容量，**严格正整数**（拒绝 `"300"`、`300.0`、布尔值、
+  `null`），上界为 SQLite INTEGER 存储宽度 2⁶³−1；
+- 由此容量分出的**总箱数不得超过 500**——超限（单位填错等）在写库前以
+  `carton_capacity` 字段错误拒绝（422）。
+
+容量非正整数、非整数、总箱数超过 500，都返回 `loc` 结尾为
+`["body","carton_capacity"]` 的 **422**；夹带或拼写错误产生的多余字段返回
+`loc=["body","<字段名>"]` 的 `extra_forbidden` 422。任何失败都**不写库、
+不消耗装箱单编号**：随后第一次成功创建仍为 `PK-000001`。
+
+成功返回 **HTTP 201** 与完整装箱单（含每箱 0 基 `index`、`start_copy`、
+`end_copy`、`copy_count`）：
+
+```bash
+curl -s -X POST http://localhost:8000/packing-plans \
+  -H 'Content-Type: application/json' \
+  -d '{"quote_id": "Q-000001", "carton_capacity": 300}'
+```
+
+验收基准：**16 页 / 1000 册**报价按 **300 册/箱** 分成 **300、300、300、100**
+四箱：
+
+```json
+{
+  "plan_id": "PK-000001",
+  "quote_id": "Q-000001",
+  "print_run": 1000,
+  "carton_capacity": 300,
+  "carton_count": 4,
+  "cartons": [
+    {"index": 0, "start_copy": 1, "end_copy": 300, "copy_count": 300},
+    {"index": 1, "start_copy": 301, "end_copy": 600, "copy_count": 300},
+    {"index": 2, "start_copy": 601, "end_copy": 900, "copy_count": 300},
+    {"index": 3, "start_copy": 901, "end_copy": 1000, "copy_count": 100}
+  ],
+  "created_at": "2026-09-12T03:20:11.847021+00:00"
+}
+```
+
+| 输入（来源为 1000 册报价，另有说明除外） | 结果 |
+| --- | --- |
+| 1000 册、容量 300 | 201，四箱 300/300/300/100，末箱 100 |
+| 600 册、容量 300（整除） | 201，两箱各 300，无短箱 |
+| 500 册、容量 1（恰好 500 箱） | 201，500 箱 |
+| 1000 册、容量 1（1000 箱） | 422，`…more than the maximum of 500.`，loc 指向 `carton_capacity` |
+| 1001 册、容量 2（⌈1001/2⌉=501 箱） | 422，422 信息含 `501`，loc 指向 `carton_capacity` |
+| `carton_capacity: 0` / `-1` | 422，`…must be at least 1.`，loc 指向 `carton_capacity` |
+| `carton_capacity: "300"` / `300.0` / `true` / `null` | 422，`…must be an integer.`，loc 指向 `carton_capacity` |
+| `carton_capacity: 2^63` | 422，`…at most…`，loc 指向 `carton_capacity` |
+| `quote_id: "Q-999999"` / `"not-a-quote"` / `"Q-"` | 404，`{"detail": "Unknown quote_id: '…'."}` |
+| `quote_id: 1` / `true` / `null` | 422，loc 指向 `quote_id` |
+| 夹带 `label` 等多余字段 | 422，`extra_forbidden`，loc 指向多余字段 |
+| `{}` | 422，两个字段全部报缺失 |
+
+### `GET /packing-plans/{plan_id}`（交接重读）
+
+交接人员按装箱单编号重新读取**完整**分箱结果，响应与创建时一致；进程重启后
+数据仍在（同一 SQLite 文件）。接受规范形式 `PK-000001` 与裸数字 `1`；
+编号无法识别或不存在返回 **404**：
+`{"detail": "Unknown packing plan_id: '…'."}`。
+
+```bash
+curl -s http://localhost:8000/packing-plans/PK-000001
+```
+
 ### 报价数据库配置
 
 - 默认数据库文件为工作目录下的 `quotes.sqlite3`；
@@ -468,9 +559,19 @@ pytest 覆盖排列不变量与错误处理：
   交换基准与候选后两个差额符号反转、较低金额编号不变；金额相等时
   `lower_quote_id` 为 `null`；缺失/非法编号 404 并指出对应编号、页数或
   印量口径冲突 409，任何失败都不改写报价状态、确认时间或金额快照；
-  相同编号（含 `Q-1` 与 `1`）、布尔值、非字符串编号、多余与缺失字段均 422；
+| 相同编号（含 `Q-1` 与 `1`）、布尔值、非字符串编号、多余与缺失字段均 422； |
 - 非法计价参数（布尔值、浮点单价、负数、多余字段、缺字段）均返回 422
   且 `loc` 指向出错字段，失败请求不消耗报价编号；
+- 装箱验收基准：16 页 / 1000 册报价按 300 册/箱分成 300、300、300、100
+  四箱（末箱 100 册），并验证 600 册按 300 整除分两箱、1 册/箱恰好 500 箱
+  等边界；全部 1..印量册号不重不漏、连续覆盖；
+- 装箱校验：容量非严格正整数、总箱数超过 500 均返回 422 且 `loc` 指向
+  `carton_capacity`；多余字段 422 指向该字段；来源报价不存在或编号无法
+  识别返回 404；非法或超限请求**不落库、不消耗装箱单编号**（随后成功创建
+  仍为 `PK-000001`）；
+- 装箱持久化：装箱单表头与各箱范围随版本化迁移写入同一 SQLite 文件，
+  可按编号原样读回、可脱离仓储直接读 SQLite 核对，进程重启后仍在，
+  旧版（仅有报价表）数据库可平滑升级且原报价数据不变；
 - 原 `POST /imposition`、`POST /imposition/locate` 与 `GET /health`
   契约保持不变（回归测试）。
 
@@ -486,7 +587,8 @@ app/
   __init__.py
   imposition.py        # 纯拼版算法核心（无框架依赖，可独立复用/测试）
   quotes.py            # 纯报价领域核心：校验、纸张总量与 Decimal 金额快照
-  quote_repository.py  # SQLite 仓储与版本化迁移（随应用启动、同进程）
+  packing.py           # 纯装箱领域核心：自第 1 册起确定性连续分箱与校验
+  quote_repository.py  # SQLite 仓储与版本化迁移（报价 + 装箱单，随应用启动）
   schemas.py           # Pydantic 请求/响应模型与字段级校验
   main.py              # FastAPI 路由与启动迁移（lifespan）
 tests/
@@ -497,6 +599,9 @@ tests/
   test_quotes_core.py      # 报价领域核心：算法定量、方案核对与输入校验
   test_quotes_repository.py# SQLite 持久化、批量取回、迁移幂等与生命周期
   test_quotes_api.py       # 报价 HTTP 契约：验收基准、compare、404/409/422
+  test_packing_core.py     # 装箱领域核心：300/300/300/100、整除分箱、500 箱上限
+  test_packing_repository.py# 装箱 SQLite 持久化、原样读回、原子失败与迁移升级
+  test_packing_api.py      # 装箱 HTTP 契约：验收基准、404/422、不消耗编号、回归
 Dockerfile
 docker-compose.yml
 requirements.txt

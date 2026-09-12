@@ -42,6 +42,12 @@ from .quotes import (
     validate_print_run,
     validate_unit_price,
 )
+from .packing import (
+    MAX_CARTON_COUNT,
+    MIN_CARTON_CAPACITY,
+    InvalidCartonCapacity,
+    validate_carton_capacity,
+)
 
 
 class ImpositionRequest(BaseModel):
@@ -318,6 +324,68 @@ class ImpositionResponse(BaseModel):
     sheets: list[SheetOut]
 
 
+class PackingPlanRequest(BaseModel):
+    # Same strict boundary as the other requests: typos and unrelated
+    # fields are rejected with a field-level 422 instead of being silently
+    # dropped.
+    model_config = ConfigDict(extra="forbid")
+
+    # Quote numbers are strings: bool (an int subclass), ints, null,
+    # lists, ... are boundary type errors. An unknown/malformed number is
+    # a 404 decided by the handler once the quote snapshot is read.
+    quote_id: str = Field(
+        description="Number of the quote whose print run is packed, e.g. Q-000001."
+    )
+    carton_capacity: int = Field(
+        ge=MIN_CARTON_CAPACITY,
+        description=(
+            "Copies per carton: strict positive integer. Splits needing "
+            f"more than {MAX_CARTON_COUNT} cartons are refused."
+        ),
+    )
+
+    @field_validator("quote_id", mode="before")
+    @classmethod
+    def _reject_non_string_quote_id(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("quote_id must be a string.")
+        return value
+
+    @field_validator("carton_capacity", mode="before")
+    @classmethod
+    def _validate_carton_capacity(cls, value: object) -> int:
+        # Single source of truth is the pure core; its ValueError subclass
+        # is reported by Pydantic as a field error on carton_capacity
+        # (HTTP 422). The 500-carton limit is cross-input (it depends on
+        # the quoted print run) and is enforced in the handler, also as a
+        # carton_capacity error.
+        try:
+            return validate_carton_capacity(value)
+        except InvalidCartonCapacity as exc:
+            raise ValueError(str(exc)) from exc
+
+
+class CartonOut(BaseModel):
+    index: int = Field(description="Carton number from the first one packed, 0-based.")
+    start_copy: int = Field(description="First one-based copy number in this carton.")
+    end_copy: int = Field(description="Last one-based copy number in this carton.")
+    copy_count: int = Field(
+        description="Copies actually in this carton; only the last carton is short."
+    )
+
+
+class PackingPlanResponse(BaseModel):
+    plan_id: str = Field(description="Public packing plan number, e.g. PK-000001.")
+    quote_id: str = Field(description="The quote whose print run was packed.")
+    print_run: int = Field(description="Copies packed, read from the quote snapshot.")
+    carton_capacity: int = Field(description="Echoed validated copies-per-carton.")
+    carton_count: int = Field(description="Total number of cartons, at most 500.")
+    cartons: list[CartonOut] = Field(
+        description="Cartons in packing order; ranges are contiguous from copy 1."
+    )
+    created_at: str = Field(description="ISO 8601 creation timestamp (UTC).")
+
+
 class LocateResponse(BaseModel):
     total_pages: int = Field(description="Echoed validated booklet page count.")
     page_number: int = Field(description="Echoed validated located page.")
@@ -342,6 +410,9 @@ __all__ = [
     "QuoteCompareResponse",
     "QuoteRequest",
     "QuoteResponse",
+    "PackingPlanRequest",
+    "PackingPlanResponse",
+    "CartonOut",
     "SheetOut",
     "MIN_PAGES",
     "MAX_PAGES",

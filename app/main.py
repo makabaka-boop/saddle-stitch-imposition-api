@@ -8,8 +8,14 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 
 from .imposition import impose, locate_page
+from .packing import (
+    TooManyCartons,
+    build_packing as build_packing_allocation,
+    parse_packing_plan_id,
+)
 from .quote_repository import (
     DEFAULT_DB_PATH,
     QuoteAlreadyConfirmed,
@@ -25,10 +31,13 @@ from .quotes import (
     parse_quote_id,
 )
 from .schemas import (
+    CartonOut,
     ImpositionRequest,
     ImpositionResponse,
     LocateRequest,
     LocateResponse,
+    PackingPlanRequest,
+    PackingPlanResponse,
     QuoteCompareRequest,
     QuoteCompareResponse,
     QuoteRequest,
@@ -258,3 +267,102 @@ def compare_quote_snapshots(
         amount_difference=decimal_to_str(comparison.amount_difference),
         lower_quote_id=comparison.lower_quote_id,
     )
+
+
+def _packing_plan_response(plan) -> PackingPlanResponse:
+    allocation = plan.allocation
+    return PackingPlanResponse(
+        plan_id=plan.plan_id,
+        quote_id=plan.quote_id,
+        print_run=allocation.print_run,
+        carton_capacity=allocation.carton_capacity,
+        carton_count=allocation.carton_count,
+        cartons=[
+            CartonOut(
+                index=carton.index,
+                start_copy=carton.start_copy,
+                end_copy=carton.end_copy,
+                copy_count=carton.copy_count,
+            )
+            for carton in allocation.cartons
+        ],
+        created_at=plan.created_at,
+    )
+
+
+def _raise_carton_capacity_error(message: str, value: object) -> None:
+    # The 500-carton limit is a rule about carton_capacity relative to the
+    # quoted run, so it is reported through the same field-level 422
+    # envelope as the boundary validation and never reaches persistence.
+    raise RequestValidationError(
+        [
+            {
+                "type": "value_error",
+                "loc": ("body", "carton_capacity"),
+                "msg": f"Value error, {message}",
+                "input": value,
+            }
+        ]
+    )
+
+
+@app.post(
+    "/packing-plans",
+    response_model=PackingPlanResponse,
+    status_code=201,
+    tags=["packing"],
+    summary="Split a quoted print run into contiguous cartons from copy 1",
+    responses={
+        404: {"description": "Unknown quote number."},
+        422: {"description": "Invalid capacity, over-500 cartons, or extra fields."},
+    },
+)
+def create_packing_plan(
+    request: PackingPlanRequest, repository: QuoteRepositoryDep
+) -> PackingPlanResponse:
+    # Read the immutable quote snapshot first; a malformed or unknown
+    # number is a 404 before any allocation number is produced.
+    quote_row_id = parse_quote_id(request.quote_id)
+    if quote_row_id is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown quote_id: {request.quote_id!r}."
+        )
+    quote = repository.get(quote_row_id)
+    if quote is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown quote_id: {request.quote_id!r}."
+        )
+
+    # The domain object owns the deterministic split; the only rule that
+    # cannot be checked at the field boundary (it depends on the quoted
+    # run) is the 500-carton cap, and it is still reported on
+    # carton_capacity before anything is written.
+    try:
+        allocation = build_packing_allocation(
+            quote.snapshot.print_run, request.carton_capacity
+        )
+    except TooManyCartons as exc:
+        _raise_carton_capacity_error(str(exc), request.carton_capacity)
+
+    plan = repository.insert_packing_plan(quote_row_id, allocation)
+    return _packing_plan_response(plan)
+
+
+@app.get(
+    "/packing-plans/{plan_id}",
+    response_model=PackingPlanResponse,
+    status_code=200,
+    tags=["packing"],
+    summary="Re-read a persisted packing plan with every carton range",
+    responses={404: {"description": "Unknown packing plan number."}},
+)
+def get_packing_plan(
+    plan_id: str, repository: QuoteRepositoryDep
+) -> PackingPlanResponse:
+    row_id = parse_packing_plan_id(plan_id)
+    plan = repository.get_packing_plan(row_id) if row_id is not None else None
+    if plan is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown packing plan_id: {plan_id!r}."
+        )
+    return _packing_plan_response(plan)

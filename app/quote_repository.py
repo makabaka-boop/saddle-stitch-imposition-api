@@ -1,10 +1,12 @@
-"""SQLite repository for quote snapshots and their lifecycle.
+"""SQLite repository for quote snapshots, their lifecycle and packing plans.
 
 The repository lives in the same process as the API: migrations run at
 application startup and every operation opens a short-lived connection
 to the same database file — no external service is introduced. Amounts
 are stored as TEXT so the exact Decimal snapshot survives the round
-trip (SQLite has no native decimal type).
+trip (SQLite has no native decimal type). A packing plan's header and
+its per-carton copy ranges are written together in one transaction, so
+a failure leaves no partial plan and consumes no plan number.
 """
 
 from __future__ import annotations
@@ -15,6 +17,12 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from .packing import (
+    Carton,
+    PackingAllocation,
+    PackingPlan,
+    format_packing_plan_id,
+)
 from .quotes import (
     MAX_TOTAL_SHEETS,
     QUOTE_STATUSES,
@@ -53,6 +61,33 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
         )
         """,
     ),
+    (
+        2,
+        """
+        CREATE TABLE packing_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_quote_id INTEGER NOT NULL,
+            print_run INTEGER NOT NULL,
+            carton_capacity INTEGER NOT NULL,
+            carton_count INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """,
+    ),
+    (
+        3,
+        """
+        CREATE TABLE packing_cartons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            packing_plan_id INTEGER NOT NULL,
+            carton_index INTEGER NOT NULL,
+            start_copy INTEGER NOT NULL,
+            end_copy INTEGER NOT NULL,
+            copy_count INTEGER NOT NULL,
+            UNIQUE (packing_plan_id, carton_index)
+        )
+        """,
+    ),
 )
 
 
@@ -74,6 +109,15 @@ class QuoteExceedsStorageCapacity(Exception):
     """
 
 
+class PackingExceedsStorageCapacity(Exception):
+    """Raised when a packing allocation's INTEGER columns cannot fit storage.
+
+    Mirrors :class:`QuoteExceedsStorageCapacity`: the request boundary
+    already rejects such input with a field-level 422, but an allocation
+    built straight against the core is refused before the driver sees it.
+    """
+
+
 # Every sheet/run column is a signed 64-bit SQLite INTEGER.
 _INTEGER_COLUMNS = (
     "total_pages",
@@ -91,6 +135,21 @@ def _assert_snapshot_fits_storage(snapshot: QuoteSnapshot) -> None:
         if value > MAX_TOTAL_SHEETS:
             raise QuoteExceedsStorageCapacity(
                 f"snapshot column {column}={value} exceeds the SQLite "
+                f"INTEGER capacity of {MAX_TOTAL_SHEETS}."
+            )
+
+
+def _assert_allocation_fits_storage(allocation: PackingAllocation) -> None:
+    # print_run and carton_capacity are validated as storable ints by the
+    # core; this keeps direct callers safe as well if that ever changes.
+    for column, value in (
+        ("print_run", allocation.print_run),
+        ("carton_capacity", allocation.carton_capacity),
+        ("carton_count", allocation.carton_count),
+    ):
+        if value > MAX_TOTAL_SHEETS:
+            raise PackingExceedsStorageCapacity(
+                f"packing column {column}={value} exceeds the SQLite "
                 f"INTEGER capacity of {MAX_TOTAL_SHEETS}."
             )
 
@@ -188,6 +247,102 @@ class QuoteRepository:
                 "SELECT * FROM quotes WHERE id = ?", (row_id,)
             ).fetchone()
         return _row_to_quote(row) if row is not None else None
+
+    def insert_packing_plan(
+        self, source_quote_row_id: int, allocation: PackingAllocation
+    ) -> PackingPlan:
+        """Persist a new packing plan and all its carton ranges.
+
+        The plan header and every carton row are written in one
+        transaction, so a failure leaves no partial plan and consumes no
+        plan number (AUTOINCREMENT is only advanced by a committed
+        INSERT).
+        """
+
+        # Refuse out-of-width columns before opening the write transaction.
+        _assert_allocation_fits_storage(allocation)
+        created_at = _utcnow()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO packing_plans (
+                    source_quote_id, print_run, carton_capacity,
+                    carton_count, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    source_quote_row_id,
+                    allocation.print_run,
+                    allocation.carton_capacity,
+                    allocation.carton_count,
+                    created_at,
+                ),
+            )
+            plan_row_id = cursor.lastrowid
+            assert plan_row_id is not None  # sqlite always sets it after INSERT
+            connection.executemany(
+                """
+                INSERT INTO packing_cartons (
+                    packing_plan_id, carton_index, start_copy,
+                    end_copy, copy_count
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        plan_row_id,
+                        carton.index,
+                        carton.start_copy,
+                        carton.end_copy,
+                        carton.copy_count,
+                    )
+                    for carton in allocation.cartons
+                ],
+            )
+        return PackingPlan(
+            plan_id=format_packing_plan_id(plan_row_id),
+            quote_id=format_quote_id(source_quote_row_id),
+            allocation=allocation,
+            created_at=created_at,
+        )
+
+    def get_packing_plan(self, row_id: int) -> PackingPlan | None:
+        """Return the stored packing plan for ``row_id``, or None.
+
+        The header and all carton rows are read together; carton order is
+        fixed by the stored index so the re-read ranges match the original
+        first-copy-to-last split exactly.
+        """
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM packing_plans WHERE id = ?", (row_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            carton_rows = connection.execute(
+                "SELECT * FROM packing_cartons WHERE packing_plan_id = ?"
+                " ORDER BY carton_index",
+                (row_id,),
+            ).fetchall()
+        allocation = PackingAllocation(
+            print_run=row["print_run"],
+            carton_capacity=row["carton_capacity"],
+            carton_count=row["carton_count"],
+            cartons=tuple(
+                Carton(
+                    index=carton_row["carton_index"],
+                    start_copy=carton_row["start_copy"],
+                    end_copy=carton_row["end_copy"],
+                )
+                for carton_row in carton_rows
+            ),
+        )
+        return PackingPlan(
+            plan_id=format_packing_plan_id(row["id"]),
+            quote_id=format_quote_id(row["source_quote_id"]),
+            allocation=allocation,
+            created_at=row["created_at"],
+        )
 
     def get_many(self, row_ids: tuple[int, ...]) -> list[Quote | None]:
         """Fetch several quotes in one read, keeping the input order.
